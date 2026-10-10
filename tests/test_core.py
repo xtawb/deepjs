@@ -734,13 +734,19 @@ class UpdateTests(unittest.TestCase):
             code, text, ran = self.updating(version=version)
             self.assertEqual(text.splitlines()[1], "by xtawb · https://github.com/xtawb/deepjs")
 
-    def test_changelog_of_the_release_already_installed(self):
+    def test_with_nothing_newer_it_shows_what_this_release_changed(self):
         code, text, ran = self.updating(version="0.4.0", notes="## Fixes\n- one", answer="y")
-        self.assertNotIn("What changed", text)                      # nothing newer: one line and whose tool it is
-        code, text, ran = self.updating(version="0.4.0", notes="## Fixes\n- one", answer="y", changelog=True)
         self.assertEqual((code, ran, self.asked), (0, [], []))
         self.assertIn("0.4.0 is the latest release.\nby xtawb", text)
         self.assertIn("What changed:\n  ## Fixes\n  - one\n\nRelease page: ", text)
+        coloured = self.updating(version="0.4.0", notes="## Fixes\n- one", colour=True)[1]
+        self.assertIn("\x1b[1m\x1b[36mFixes\x1b[0m\x1b[0m", coloured)
+
+    def test_a_copy_ahead_of_every_release_is_told_so(self):
+        code, text, ran = self.updating(version="0.3.9", notes="## Older\n- not what this copy is", answer="y")
+        self.assertEqual((code, ran, self.asked), (0, [], []))
+        self.assertIn("0.4.0 is ahead of the latest release, 0.3.9.", text)
+        self.assertNotIn("What changed", text)                      # those notes describe another version
 
     def test_update_in_colour(self):
         notes = "## Fixes\n- `deepjs update` is **quicker**\n- plain\x1b[31m\n\n```bash\npip install x\n```\nSee [the page](https://x.y)."
@@ -810,13 +816,13 @@ class UpdateTests(unittest.TestCase):
 
     def test_update_spellings(self):
         from deepjs import cli
-        for argv, yes, colour, changelog in (
-                (["update"], False, None, False), (["--update"], False, None, False), (["-update"], False, None, False),
-                (["update", "--yes"], True, None, False), (["--update", "-y"], True, None, False),
-                (["update", "--no-color"], False, False, False), (["-update", "--changelog"], False, None, True)):
+        for argv, yes, colour in ((["update"], False, None), (["--update"], False, None), (["-update"], False, None),
+                                  (["update", "--yes"], True, None), (["--update", "-y"], True, None),
+                                  (["update", "--no-color"], False, False),
+                                  (["-update", "--changelog"], False, None)):        # what 0.4.5 asked for: still accepted
             with mock.patch.object(update, "run_update", return_value=0) as run:
                 self.assertEqual(cli.main(argv), 0)
-            run.assert_called_once_with(assume_yes=yes, colour=colour, changelog=changelog)
+            run.assert_called_once_with(assume_yes=yes, colour=colour)
 
 
 if __name__ == "__main__":

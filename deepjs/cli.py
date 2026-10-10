@@ -22,7 +22,7 @@ examples:
   deepjs scan https://app.example.com --sources src/   write the original sources recovered from source maps
   deepjs scan https://app.example.com --check-npm      check bundled package names against the public npm registry
   deepjs diff old/report.json new/report.json          what changed between two scans
-  deepjs update                                        show what the latest release changed and offer to install it
+  deepjs update                                        show what the latest release changed; offer to install it if newer
 
 Only scan applications you own or are authorised to test.
 """
@@ -87,8 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     u = sub.add_parser("update", help="show what the latest release changed and install it (asks first)")
     u.add_argument("-y", "--yes", action="store_true", help="install without asking")
-    u.add_argument("--changelog", action="store_true",
-                   help="show what the latest release changed even when it is the one installed")
+    u.add_argument("--changelog", action="store_true", help=argparse.SUPPRESS)    # 0.4.5 needed it; now always shown
     u.add_argument("--no-color", action="store_true", help="disable coloured output")
 
     d = sub.add_parser("diff", help="compare two report.json files")
@@ -189,7 +188,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "diff":
         return cmd_diff(args)
     if args.command == "update":
-        return update.run_update(assume_yes=args.yes, colour=False if args.no_color else None, changelog=args.changelog)
+        return update.run_update(assume_yes=args.yes, colour=False if args.no_color else None)
     if args.command == "serve":
         from deepjs.serve import serve
         return serve(reveal=args.reveal, entropy=args.entropy)

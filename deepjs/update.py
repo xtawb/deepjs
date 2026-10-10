@@ -225,11 +225,11 @@ def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: 
                fetch: Callable[[], Release] = fetch_release, ask: Callable[[str], str] = input,
                run: Callable[[List[str]], int] = subprocess.call, interactive: Optional[bool] = None,
                checkout: Optional[bool] = None, managed: Optional[bool] = None, installer: Optional[str] = None,
-               colour: Optional[bool] = None, changelog: bool = False) -> int:
+               colour: Optional[bool] = None) -> int:
     """
-    Look for a newer release, show what changed, and install it if the user agrees.
-    Returns a process exit status. `changelog`: show what the latest release changed even when
-    it is the one installed. `colour`: None decides by where `out` goes (a terminal, and
+    Look for a newer release, show what changed, and install it if the user agrees. With nothing
+    newer, what is shown is what the release already installed changed.
+    Returns a process exit status. `colour`: None decides by where `out` goes (a terminal, and
     NO_COLOR not set). The other injectable pieces exist for the tests.
     """
     out = out or sys.stdout
@@ -257,11 +257,14 @@ def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: 
         say()
         say("Release page: " + st.cyan(release.url if release.url.startswith("https://github.com/xtawb/deepjs/") else RELEASES_PAGE))
 
+    if is_newer(current, release.version):              # a copy built from the repository, ahead of any release
+        say(st.green(f"deepjs {current} is ahead of the latest release, {release.version}."))
+        say(st.dim(MADE_BY))
+        return 0
     if not is_newer(release.version, current):
         say(st.green(f"deepjs {current} is the latest release."))
         say(st.dim(MADE_BY))
-        if changelog:
-            what_changed()
+        what_changed()
         return 0
 
     say(st.bold(st.green(f"deepjs {release.version}")) + f" is available (this is {current}).")
