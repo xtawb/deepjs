@@ -310,6 +310,36 @@ class SecretTests(unittest.TestCase):
         self.assertEqual(secret_kinds('var parser={repeatNodeCount:37,tokenData:"%s",tokenizers:[0,1]}' % table), set())
         self.assertEqual(secret_kinds('throwError("x",{name:"OffchainLookup",signature:"OffchainLookup(address,string[],bytes,bytes4,bytes)"})'), set())
 
+    # The next three are the four findings of the first real Burp session — all false positives.
+
+    def test_highlighter_token_types_are_not_secrets(self):
+        ace = ('var r={start:[{token:"xml-pe.doctype.xml",regex:"(<!)(DOCTYPE)",next:"doctype",caseInsensitive:!0},'
+               '{token:"keyword.operator.attribute-equals.xml",regex:"="},{defaultToken:"text.tag-whitespace.xml"}]};')
+        self.assertEqual(scan_program(Program(ace), "mode-xml.js"), [])
+        self.assertEqual(classify("xml-pe.doctype.xml")[0], "benign")          # the shape alone is enough
+        self.assertEqual(classify("meta.tag.punctuation")[0], "benign")
+        token = "Qm2Lk8Pz" + "4Rt6Vw1Y" + "b5Nc7Hf0"
+        self.assertEqual(secret_kinds('var c={token:"%s"}' % token), {"HARDCODED_SECRET"})   # a real one still is
+
+    def test_tokens_in_a_page_belong_to_the_visitor(self):
+        values = {"ajaxpipe_token": "AXk6Zr9Qm2" + "Lk8Pz4GM", "token": "AdTLUvdWw1" + "Yb5Nc7uJZY",
+                  "accessToken": "EAABsbCS1i" + "HgBO0ZCq7", "clientSecret": "Zx9Qm2Lk8Pz4Rt6V" + "w1Yb5Nc7Hf0Jg3Ua"}
+        code = "boot({" + ",".join('%s:"%s"' % kv for kv in values.items()) + "})"
+        page = {(s.kind, s.key, s.public) for s in scan_program(Program(code), "https://x.io/account#inline-1")}
+        self.assertEqual(page, {("PAGE_TOKEN", "ajaxpipe_token", True), ("PAGE_TOKEN", "token", True),
+                                ("PAGE_TOKEN", "accessToken", True), ("HARDCODED_SECRET", "clientSecret", False)})
+        bundle = {(s.kind, s.public) for s in scan_program(Program(code), "https://x.io/static/app.js")}
+        self.assertEqual(bundle, {("HARDCODED_SECRET", False)})                # shipped to everyone: a finding
+
+    def test_third_party_embeds_are_not_the_application(self):
+        from deepjs.engine import Engine, Options
+        page = '<html><script>boot({token:"%s"})</script></html>' % ("AdTLUvdWw1" + "Yb5Nc7uJZY")
+        for host in ("www.instagram.com", "platform.twitter.com", "www.youtube.com", "js.stripe.com"):
+            engine = Engine(Options())
+            engine.feed("https://%s/x/embed" % host, page.encode(), "html")
+            result = engine.snapshot()
+            self.assertEqual((result.secrets, result.endpoints), ([], []), host)
+
     def test_supabase_roles(self):
         anon = jwt({"iss": "supabase", "ref": "abc", "role": "anon", "exp": int(time.time()) + 10 ** 8})
         svc = jwt({"iss": "supabase", "ref": "abc", "role": "service_role", "exp": int(time.time()) + 10 ** 8})

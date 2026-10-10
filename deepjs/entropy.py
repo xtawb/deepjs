@@ -151,6 +151,8 @@ _BENIGN = [
 ]
 # kebab / snake / dotted / event:name — benign only when it also reads like words
 _IDENTIFIERISH = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[-_.:/][A-Za-z0-9]+)+$")
+# lower-case words joined by separators — a scope or token-type name (xml-pe.doctype.xml), whatever its letters
+_SCOPE_NAME = re.compile(r"^[a-z]+(?:[-_.:/][a-z]+)+$")
 
 
 def classify(value: str, strong_key: bool = False) -> Tuple[str, float]:
@@ -170,6 +172,8 @@ def classify(value: str, strong_key: bool = False) -> Tuple[str, float]:
         if rx.match(v):
             return "benign", 0.05
     if words >= 0.45 and _IDENTIFIERISH.match(v):
+        return "benign", 0.06
+    if not strong_key and _SCOPE_NAME.match(v):
         return "benign", 0.06
     has_digit_or_symbol = bool(re.search(r"[\d!@#$%^&*+=/\\|~?]", v))
     if not has_digit_or_symbol and (not v.isascii() or words >= 0.45):

@@ -163,7 +163,12 @@ nothing can be written outside the directory you chose.
 secret-bearing name (`clientSecret`, `X-Api-Key`, `Authorization`…). JWTs are
 decoded (never used): a Supabase `service_role` key is critical, an `anon` key
 is public by design, an expired token is low. Placeholders, form labels,
-storage-key names and translations are recognised and dropped.
+storage-key names and translations are recognised and dropped. A token written
+into an HTML page's own inline script is reported as `PAGE_TOKEN` (info): it
+was put there for the visitor — a session, CSRF or API token — and is not a
+secret shipped to everyone; the same value in a static bundle is. Pages of
+third-party platforms embedded in the site (social embeds, ad and analytics
+frames) are not analysed at all.
 
 **Hosts** — every host mentioned, classified in-scope / cloud storage (S3,
 GCS, Azure Blob, Firebase, Spaces, R2, OSS) / internal / third-party, with

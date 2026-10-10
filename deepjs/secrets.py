@@ -284,6 +284,24 @@ def _passphrase_like(value: str) -> bool:
     return len(re.findall(r"[A-Z][a-z]+", value)) >= 3
 
 
+_GRAMMAR_SIBLINGS = frozenset({"regex", "next", "push", "onMatch", "defaultToken", "caseInsensitive", "nextState"})
+# a name for something the server hands to this visitor: a session, CSRF or API token
+_SESSION_KEY = re.compile(r"(?:^|_)(?:token|jwt|bearer|auth|authorization|sid)(?:_|$)")
+_NOT_SESSION_KEY = re.compile(r"secret|pass(?:word|wd|phrase)?(?:_|$)|pwd|private|api_?key|client|signing|encrypt|master|license")
+
+
+def _in_grammar_rule(p: Program, i: int) -> bool:
+    """{token: "keyword.operator", regex: /…/, next: "start"} — a syntax highlighter's rule, not a credential."""
+    lo, hi = max(0, i - 12), min(p.n, i + 12)
+    return any(p.tokens[k][K] == ID and p.tokens[k][V] in _GRAMMAR_SIBLINGS and p.is_punc(k + 1, ":") for k in range(lo, hi))
+
+
+def _page_token(value: str, key: str, file: str, line: int) -> Secret:
+    return Secret("PAGE_TOKEN", "info", 0.6, value, key, file, line,
+                  f"'{key[:60]}' is set in the page itself — normally a per-visit value for the current user (session, CSRF "
+                  "or API token), not a secret shipped to everyone. See what it grants before treating it as a finding.", True)
+
+
 def _near_algolia(p: Program, i: int) -> bool:
     lo, hi = max(0, i - 14), min(p.n, i + 14)
     names = {str(p.tokens[k][V]).lower() for k in range(lo, hi) if p.tokens[k][K] in (ID, STR)}
@@ -294,6 +312,7 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
     """Find credentials in one tokenized file."""
     out: List[Secret] = []
     seen: set = set()
+    in_page = "#inline-" in file
 
     def add(s: Secret) -> None:
         k = (s.kind, s.value)
@@ -332,6 +351,11 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
         strength = key_strength(key) if key else 0
         if strength <= 0 and not entropy:
             continue
+        name = normalise_key(key)
+        if name in ("token", "default_token") and _in_grammar_rule(p, i):
+            continue
+        # an inline script of an HTML page: what is in it was written for this visitor
+        visitor = in_page and bool(_SESSION_KEY.search(name)) and not _NOT_SESSION_KEY.search(name)
         value = re.sub(r"^(?:Bearer|Token|Basic|ApiKey)\s+", "", text.strip(), flags=re.I)
         if len(value) < 8 or len(value) > 512 or "\n" in value:
             continue
@@ -354,12 +378,17 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
         if strength == 2:
             if label == "weak" and not re.search(r"[\d!@#$%^&*+=/\\|~?]", value):
                 continue
+            if visitor:
+                add(_page_token(value, key, file, p.line(i)))
+                continue
             conf = 0.45 + 0.4 * score
             sev = "high" if conf >= 0.72 else "medium"
             add(Secret("HARDCODED_SECRET", sev, min(conf, 0.92), value, key, file, p.line(i),
                        f"Literal value assigned to '{key[:60]}'."))
         elif strength == 1:
-            if label == "secret":
+            if label == "secret" and visitor:
+                add(_page_token(value, key, file, p.line(i)))
+            elif label == "secret":
                 add(Secret("HARDCODED_SECRET", "medium", 0.4 + 0.4 * score, value, key, file, p.line(i),
                            f"Random-looking value assigned to '{key[:60]}'."))
         elif entropy and label == "secret" and 32 <= len(value) <= 128 and strength == 0 \

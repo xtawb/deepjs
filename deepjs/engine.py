@@ -71,7 +71,14 @@ _VENDOR_HOSTS = re.compile(
     r"|hubspot\.com|hsforms\.net|zendesk\.com|zdassets\.com|crisp\.chat|tawk\.to|optimizely\.com|mixpanel\.com"
     r"|amplitude\.com|fullstory\.com|onetrust\.com|cookielaw\.org|cookiebot\.com|youtube\.com|ytimg\.com|vimeo\.com"
     r"|tiktok\.com|snapchat\.com|pinterest\.com|addthis\.com|disqus\.com|trustpilot\.com|typekit\.net|fontawesome\.com"
-    r"|polyfill\.io|mxpnl\.com|launchdarkly\.com|pendo\.io|heapanalytics\.com|appcues\.com|drift\.com|driftt\.com)$",
+    r"|polyfill\.io|mxpnl\.com|launchdarkly\.com|pendo\.io|heapanalytics\.com|appcues\.com|drift\.com|driftt\.com"
+    r"|instagram\.com|cdninstagram\.com|threads\.net|whatsapp\.com|whatsapp\.net|messenger\.com|fbsbx\.com|twimg\.com"
+    r"|tiktokcdn\.com|reddit\.com|redditstatic\.com|vk\.com|yandex\.ru|yandex\.net|googleadservices\.com"
+    r"|googletagservices\.com|criteo\.com|criteo\.net|taboola\.com|outbrain\.com|amazon-adsystem\.com|adsrvr\.org"
+    r"|adnxs\.com|rubiconproject\.com|pubmatic\.com|scorecardresearch\.com|quantserve\.com|mouseflow\.com"
+    r"|crazyegg\.com|trustarc\.com|usercentrics\.eu|klaviyo\.com|list-manage\.com|chimpstatic\.com|hsappstatic\.net"
+    r"|livechatinc\.com|olark\.com|zopim\.com|tidio\.co|calendly\.com|typeform\.com|spotify\.com|soundcloud\.com"
+    r"|wistia\.com|wistia\.net|onesignal\.com|appsflyer\.com|branch\.io|userway\.org)$",
     re.I)
 
 
