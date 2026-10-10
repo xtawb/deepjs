@@ -31,6 +31,9 @@ INDEX = """<!doctype html><html><head><title>Acme</title>
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-ABCDEF1234"></script>
 <script>window.__CONFIG__ = {apiBase: "/api/v1", featureFlagsUrl: "/api/v1/flags"};</script>
 </head><body><div id="root"></div>
+<a href="/about.html">About</a> <a href="/about.html?ref=nav#team">About again</a>
+<a href="/account/logout">Log out</a> <a href="/files/brochure.pdf">Brochure</a>
+<a href="https://other.example.org/elsewhere">Elsewhere</a> <a href="mailto:hi@acme.io">Mail</a>
 <script src="/static/js/runtime.js"></script>
 <script src="/static/js/main.a1b2.js"></script>
 </body></html>"""
@@ -62,8 +65,29 @@ ADMIN_CHUNK = ('function del(e){return fetch("/api/v1/admin/users/"+e,{method:"D
 BILLING_CHUNK = 'export const inv=()=>http.get("/api/v1/billing/invoices?status=open");'
 ELEVEN_CHUNK = 'const Q="query AdminAudit($n:Int){ audit(first:$n){ id } }";'
 
+ABOUT = """<html><body><a href="/deep/level2.html">deeper</a>
+<form action="/api/v1/newsletter" method="post"><input name="email"><input name="csrf"><button name="go">Go</button></form>
+<form action="/search"><input name="q"></form>
+<script src="/static/js/about.js"></script></body></html>"""
+LEVEL2 = '<html><body><a href="/deep/level3.html">too deep</a><script>fetch("/api/v1/level2")</script></body></html>'
+LEVEL3 = '<html><body><script>fetch("/api/v1/level3")</script></body></html>'
+PRICING = '<html><body><script>fetch("/api/v1/plans")</script></body></html>'
+DASHBOARD = '<html><body><script>fetch("/api/v1/dashboard/widgets")</script></body></html>'
+ROBOTS = "User-agent: *\nDisallow: /internal-admin/\nDisallow: /backup/*.zip\nAllow: /\nSitemap: /sitemap.xml\n"
+SITEMAP = ('<?xml version="1.0"?><urlset><url><loc>{base}/pricing.html</loc></url>'
+           '<url><loc>{base}/files/brochure.pdf</loc></url></urlset>')
+
 FILES = {
     "index.html": INDEX,
+    "about.html": ABOUT,
+    "deep/level2.html": LEVEL2,
+    "deep/level3.html": LEVEL3,
+    "pricing.html": PRICING,
+    "dashboard": DASHBOARD,
+    "robots.txt": ROBOTS,
+    "static/js/about.js": 'export const team=()=>http.get("/api/v1/team");',
+    "account/logout": "<html>bye</html>",
+    "files/brochure.pdf": "%PDF-1.4",
     "static/js/runtime.js": RUNTIME,
     "static/js/main.a1b2.js": MAIN,
     "static/js/main.a1b2.js.map": json.dumps(MAIN_MAP),
@@ -79,8 +103,19 @@ def read(path):
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    requested = []                 # every path any test asked the fixture server for
+
     def log_message(self, *args):
         pass
+
+    def do_GET(self):
+        QuietHandler.requested.append(self.path)
+        super().do_GET()
+
+    def guess_type(self, path):
+        if path.endswith("dashboard") or path.endswith("logout"):
+            return "text/html"
+        return super().guess_type(path)
 
 
 class EndToEnd(unittest.TestCase):
@@ -96,9 +131,13 @@ class EndToEnd(unittest.TestCase):
         handler = functools.partial(QuietHandler, directory=cls.site)
         cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        with open(os.path.join(cls.site, "sitemap.xml"), "w", encoding="utf-8") as fh:
+            fh.write(SITEMAP.format(base=cls.base))
+        QuietHandler.requested.clear()
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.sources = os.path.join(cls.tmp.name, "recovered")
         cls.result = Engine(Options(sources_dir=cls.sources)).run([cls.base + "/"])
+        cls.first_run_requests = list(QuietHandler.requested)
         cls.calls = {(e.method, e.url) for e in cls.result.endpoints if e.is_call}
 
     @classmethod
@@ -109,6 +148,188 @@ class EndToEnd(unittest.TestCase):
 
     def test_no_errors(self):
         self.assertEqual(self.result.errors, [])
+
+    # ── crawling ──────────────────────────────────────────────────────────────
+
+    def test_crawler_follows_links_sitemap_and_routes(self):
+        pages = {f.name.replace(self.base, ""): f.origin for f in self.result.files if f.kind == "html"}
+        self.assertEqual(pages.get("/"), "target")
+        self.assertEqual(pages.get("/about.html"), "link")
+        self.assertEqual(pages.get("/deep/level2.html"), "link")              # depth 2
+        self.assertEqual(pages.get("/pricing.html"), "sitemap")               # linked from nowhere
+        self.assertEqual(pages.get("/dashboard"), "route")                    # a client route found in the bundle
+        for call in (("GET", "/api/v1/team"), ("GET", "/api/v1/level2"), ("GET", "/api/v1/plans"),
+                     ("GET", "/api/v1/dashboard/widgets")):
+            self.assertIn(call, self.calls)
+
+    def test_crawler_limits_and_safety(self):
+        asked = self.first_run_requests
+        self.assertNotIn("/deep/level3.html", asked)                          # beyond --crawl-depth
+        self.assertNotIn(("GET", "/api/v1/level3"), self.calls)
+        self.assertNotIn("/account/logout", asked)                            # never follow a state-changing link
+        self.assertNotIn("/files/brochure.pdf", asked)                        # not a page
+        self.assertEqual(asked.count("/about.html") + asked.count("/about.html?ref=nav"), 1)   # same page once
+        self.assertFalse(any("other.example.org" in f.name for f in self.result.files))
+
+    def test_forms_and_robots_become_endpoints(self):
+        by_url = {e.url: e for e in self.result.endpoints}
+        news = by_url["/api/v1/newsletter"]
+        self.assertEqual((news.method, news.kind, news.body), ("POST", "form", ["email", "csrf", "go"]))
+        self.assertEqual((by_url["/search"].method, by_url["/search"].params), ("GET", ["q"]))
+        self.assertEqual(by_url["/internal-admin/"].file, self.base + "/robots.txt")
+        self.assertIn("/backup/", by_url)
+
+    def test_no_crawl_and_page_budget(self):
+        r = Engine(Options(crawl=False)).run([self.base + "/"])
+        self.assertEqual([f.name for f in r.files if f.kind == "html"], [self.base + "/"])
+        r = Engine(Options(max_pages=2)).run([self.base + "/"])
+        self.assertEqual(len([f for f in r.files if f.kind == "html"]), 2)
+        self.assertTrue(any("--max-pages" in e for e in r.errors))
+
+    def test_target_without_scheme(self):
+        self.assertEqual(Engine._normalise_target("app.example.com/login"), "https://app.example.com/login")
+        self.assertEqual(Engine._normalise_target("localhost:3000"), "https://localhost:3000")
+        self.assertEqual(Engine._normalise_target(self.base), self.base)
+        self.assertEqual(Engine._normalise_target("bundle.js"), "bundle.js")       # a mistyped file, not a host
+        self.assertEqual(Engine._normalise_target("acme.js.org/docs"), "https://acme.js.org/docs")
+
+    def test_refused_requests_are_explained(self):
+        class Refusing:
+            requests = 0
+
+            def get(self, url):
+                from deepjs.fetch import Response
+                self.requests += 1
+                return Response(url=url, status=403, error="HTTP 403")
+        r = Engine(Options(), fetcher=Refusing()).run(["https://blocked.example.com/"])
+        self.assertTrue(any("refused" in e and "Cookie" in e for e in r.errors), r.errors)
+
+    def test_single_page_app(self):
+        """Every route returns the same shell; the API base lives in another chunk."""
+        from deepjs.fetch import Response
+        shell = ('<html><head><meta name="csrf-token" content="{n}"></head><body><a href="#main">skip</a><app-root></app-root>'
+                 '<script nonce="{n}" src="/main.js"></script><script nonce="{n}" src="/env.js"></script></body></html>')
+        main = ("".join(f'h(Link,{{to:"/section-{n}"}});' for n in range(12))
+                + "class Users{http=inject(H);root=env.apiRoot;host=this.root+`/users`;"
+                  "all(){return this.http.get(this.host)}one(id){return this.http.delete(`${this.host}/${id}`)}}")
+        env = 'const env={production:!0,apiRoot:"https://api.acme.io/v2"};'
+
+        class Spa:
+            asked = []
+            requests = 0
+
+            def get(self, url):
+                self.requests += 1
+                path = url.split("://", 1)[1].partition("/")[2]
+                self.asked.append("/" + path)
+                if path in ("robots.txt", "sitemap.xml"):
+                    return Response(url=url, status=404, error="HTTP 404")
+                if path.endswith(".js"):
+                    body = main if path == "main.js" else env
+                    return Response(url=url, status=200, headers={"content-type": "text/javascript"}, body=body.encode())
+                page = shell.replace("{n}", f"r{self.requests:04d}")      # a fresh nonce on every request
+                return Response(url=url, status=200, headers={"content-type": "text/html"}, body=page.encode())
+
+        fetcher = Spa()
+        engine = Engine(Options(), fetcher=fetcher)
+        r = engine.run(["https://spa.acme.io/"])
+        self.assertTrue(engine.spa_shell)
+        pages = [p for p in fetcher.asked if p.startswith("/section-")]
+        self.assertEqual(len(pages), 3, pages)                 # three probes, not all twelve routes
+        self.assertEqual(r.errors, [])
+        self.assertEqual({(e.method, e.url) for e in r.endpoints if e.is_call},
+                         {("GET", "https://api.acme.io/v2/users"), ("DELETE", "https://api.acme.io/v2/users/{id}")})
+
+    def test_overloaded_server_is_left_alone(self):
+        from deepjs.fetch import Response
+        home = "<html><body>" + "".join(f'<a href="/p{n}">p</a>' for n in range(30)) + "</body></html>"
+
+        class Overloaded:
+            requests = 0
+
+            def get(self, url):
+                self.requests += 1
+                if url.rstrip("/").endswith("busy.acme.io"):
+                    return Response(url=url, status=200, headers={"content-type": "text/html"}, body=home.encode())
+                return Response(url=url, status=503, error="HTTP 503")
+
+        fetcher = Overloaded()
+        r = Engine(Options(threads=2), fetcher=fetcher).run(["https://busy.acme.io/"])
+        self.assertLess(fetcher.requests, 20)                  # 30 pages were queued; it stopped long before
+        self.assertTrue(any(e.startswith("stopped early") and "--delay" in e for e in r.errors), r.errors)
+        self.assertEqual(len(r.errors), 2, r.errors)           # that, and one summary line — not one line per URL
+
+    # ── worker protocol (what the Burp extension talks to) ────────────────────
+
+    def test_serve_protocol(self):
+        import base64 as b64
+        from deepjs.serve import Worker, esc, unesc
+        self.assertEqual(unesc(esc("a\tb\nc\\d")), "a\tb\nc\\d")
+        out = io.StringIO()
+        w = Worker(out)
+
+        def feed(ident, kind, url, body):
+            out.seek(0), out.truncate()
+            w.handle("\t".join(["A", ident, kind, url, b64.b64encode(body.encode()).decode()]) + "\n")
+            return [ln.split("\t") for ln in out.getvalue().splitlines()]
+
+        base = "https://app.acme.io"
+        lines = feed("1", "auto", base + "/", INDEX)
+        self.assertEqual(lines[-1], ["D", "1"])
+        hidden = {ln[1] for ln in lines if ln[0] == "C"}
+        self.assertEqual(hidden, {base + "/static/js/runtime.js", base + "/static/js/main.a1b2.js"})
+
+        lines = feed("2", "script", base + "/static/js/runtime.js", RUNTIME)
+        hidden = {ln[1] for ln in lines if ln[0] == "C"}
+        self.assertEqual(len(hidden), 3)                                      # the three chunks no page links to
+        self.assertIn(base + "/static/js/admin.9f1c2a.chunk.js", hidden)
+
+        lines = feed("3", "script", base + "/static/js/main.a1b2.js", MAIN)
+        login = next(ln for ln in lines if ln[0] == "E" and ln[3] == "/api/v1/auth/login")
+        self.assertEqual(login[1:3], ["POST", base + "/api/v1/auth/login"])
+        self.assertEqual(login[6], "email,password")
+        self.assertIn(["M", base + "/static/js/main.a1b2.js.map", "1"], lines)
+        secret = next(ln for ln in lines if ln[0] == "S" and ln[2] == "HARDCODED_SECRET")
+        self.assertNotIn(CLIENT_SECRET, "\t".join(secret))                    # masked unless --reveal
+
+        lines = feed("4", "map", base + "/static/js/main.a1b2.js.map", json.dumps(MAIN_MAP))
+        self.assertTrue(any(ln[0] == "S" and ln[2] == "GITHUB_TOKEN" for ln in lines))
+        self.assertIn(["P", "@acme-internal/ui-kit"], lines)
+
+        lines = feed("5", "script", base + "/static/js/main.a1b2.js", MAIN)   # the same file again
+        self.assertEqual(lines, [["D", "5"]])                                 # nothing new → nothing repeated
+
+        # a service whose base URL lives in a chunk that arrives later: shown at once with the
+        # placeholder, then replaced (W = withdrawn) when the other chunk reveals the base
+        lines = feed("7", "script", base + "/static/js/svc.js",
+                     "class S{http=inject(H);root=env.gatewayRoot;host=this.root+`/rest/wallet`;"
+                     "get(){return this.http.get(this.host+`/balance`)}}")
+        early = next(ln for ln in lines if ln[0] == "E" and ln[3].endswith("/rest/wallet/balance"))
+        self.assertEqual(early[1:4], ["GET", base + "/rest/wallet/balance", "{gatewayRoot}/rest/wallet/balance"])
+        lines = feed("8", "script", base + "/static/js/env.js", 'const env={production:!0,gatewayRoot:"/gw/v2"};')
+        self.assertIn(["W", "GET", "{gatewayRoot}/rest/wallet/balance"], lines)
+        late = next(ln for ln in lines if ln[0] == "E" and ln[3].endswith("/rest/wallet/balance"))
+        self.assertEqual(late[1:4], ["GET", base + "/gw/v2/rest/wallet/balance", "/gw/v2/rest/wallet/balance"])
+
+        lines = feed("6", "script", base + "/x.js", "\x00\x01 not javascript {{{")
+        self.assertEqual(lines[-1], ["D", "6"])                               # junk never stops the worker
+        out.seek(0), out.truncate()
+        self.assertTrue(w.handle("PING\n") and out.getvalue() == "PONG\n")
+        self.assertFalse(w.handle("QUIT\n"))
+
+    def test_serve_process(self):
+        import base64 as b64
+        import subprocess
+        import sys as _sys
+        msg = "\t".join(["A", "7", "script", "https://app.acme.io/a.js",
+                         b64.b64encode(b'fetch("/api/v1/from-worker",{method:"PUT"})').decode()])
+        proc = subprocess.run([_sys.executable, "-m", "deepjs", "serve"], input=(msg + "\nQUIT\n").encode(),
+                              capture_output=True, timeout=60,
+                              cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        lines = proc.stdout.decode("utf-8").splitlines()
+        self.assertTrue(lines[0].startswith("READY\tdeepjs\t"))
+        self.assertIn("E\tPUT\thttps://app.acme.io/api/v1/from-worker", lines[1])
+        self.assertEqual(lines[-1], "D\t7")
 
     def test_chunks_no_page_links_to_are_found(self):
         scripts = {f.name.rsplit("/", 1)[-1]: f.origin for f in self.result.files if f.kind == "script"}

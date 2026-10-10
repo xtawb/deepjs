@@ -126,6 +126,36 @@ def normalise_url(url: str) -> str:
     return re.sub(r"/{2,}", "/", url)
 
 
+_BASE_NAME = re.compile(r"base|url|uri|api|host|server|endpoint|origin|root|prefix|domain|backend|gateway|service", re.I)
+
+
+def _weak_noise(text: str) -> bool:
+    """
+    Shapes that are not worth listing when only the string itself suggests a
+    URL (it is not the argument of a request): regex fragments, the one-letter
+    hosts and paths of URL-parser tests in polyfills.
+    """
+    if "(" in text or ")" in text:
+        return True
+    head = text.split("?", 1)[0].split("#", 1)[0]
+    scheme, sep, rest = head.partition("://")
+    if sep:
+        host, _, path = rest.partition("/")
+        literal_host = re.sub(r"\{[^{}]*\}", "", host)
+        if "." in literal_host or literal_host.startswith("localhost") or literal_host.startswith("["):
+            return False
+        if len(literal_host.strip("-:")) <= 1 and "{" not in host:
+            return True                                    # https://a   http://f
+        if "{" in host and len(literal_host.strip("-:")) <= 1:
+            # https://{param}{param}   https://{teamId}-   — unless a real path follows
+            return not any(len(x) >= 3 and "{" not in x for x in path.split("/"))
+        return False
+    if head.startswith("/"):
+        segs = [x for x in head.split("/") if x]
+        return bool(segs) and all(len(x) <= 1 for x in segs)   # /a/b
+    return False
+
+
 def url_like(text: str, parts: List[Part], strong: bool, bare: bool = False) -> bool:
     """
     Is this built string a URL / path?  `strong` = it is the URL argument of a
@@ -141,6 +171,8 @@ def url_like(text: str, parts: List[Part], strong: bool, bare: bool = False) -> 
     if "<" in text or ">" in text or "\\" in text or "^" in text or "*" in text.replace("/*", ""):
         return False
     if _OPAQUE_ABSOLUTE.match(text):
+        return False
+    if not strong and _weak_noise(text):
         return False
     if _ABSOLUTE.match(text):
         # scheme://user:secret@host belongs in the secrets report, not here
@@ -159,7 +191,11 @@ def url_like(text: str, parts: List[Part], strong: bool, bare: bool = False) -> 
             return False
         return len(segs) >= 2 or bool(_APIISH_ANY.search(text)) or "?" in text or "{" in text
     if text.startswith("{") and "}/" in text:
-        return True                       # {baseUrl}/users
+        if strong:
+            return True                   # {baseUrl}/users
+        name, _, rest = text[1:].partition("}")
+        literal_segs = [x for x in rest.split("?", 1)[0].split("/") if len(x) >= 2 and "{" not in x]
+        return bool(_BASE_NAME.search(name)) or bool(_APIISH_ANY.search(rest)) or len(literal_segs) >= 2
     if text.startswith(("./", "../")):
         return strong and not _STATIC_ASSET.search(text)
     if _APIISH_PREFIX.match(text):

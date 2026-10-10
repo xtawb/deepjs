@@ -79,7 +79,8 @@ or from a checkout: `pip install .`
 ## Use
 
 ```bash
-deepjs scan https://app.example.com                 # crawl the page, follow every chunk, read source maps
+deepjs scan app.example.com                         # crawl the site, follow every chunk, read source maps
+deepjs scan https://app.example.com/login --no-crawl   # just this page and its scripts
 deepjs scan https://app.example.com -o out/         # + report.json, report.md, endpoints.txt, hosts.txt
 deepjs scan dist/ bundle.js traffic.har             # a build directory, single files, or a HAR capture (offline)
 deepjs scan -l urls.txt --proxy http://127.0.0.1:8080    # every request through Burp / ZAP
@@ -91,6 +92,60 @@ deepjs diff old/report.json new/report.json         # what appeared / disappeare
 `deepjs <target>` is shorthand for `deepjs scan <target>`. Secret values are
 masked in every output unless you pass `--reveal`.
 
+## Burp Suite extension
+
+DeepJS runs inside Burp as an extension (`burp/`). Every JavaScript / HTML
+response that passes through Burp — Proxy, Repeater, anything — is analysed,
+and the results appear in a **DeepJS** tab:
+
+- **API calls** — method, URL, query names, body fields, headers, source.
+  Select rows → *Send to Repeater* builds a request skeleton (`{id}` becomes
+  `:id`, body fields become a JSON object).
+- **Secrets** — with the same public-by-design classification as the CLI.
+- **Hidden scripts** — chunks and source maps the code names but your browsing
+  never loaded. With *Fetch hidden scripts* / *Fetch source maps* ticked the
+  extension requests them **through Burp** (so they appear in the site map)
+  and analyses them. Only hosts that already served a script are contacted,
+  *In-scope only* restricts it further, and there is a ceiling of 400 requests.
+- **Hosts**, client routes, GraphQL operations, npm packages.
+- *Analyse proxy history* for traffic captured before the extension was loaded,
+  and *Analyse with DeepJS* in the context menu.
+
+It works in Burp Suite Community and Professional. The analysis is done by the
+Python engine in a local worker process (`deepjs serve`), so the extension
+needs DeepJS installed:
+
+```bash
+pip install --upgrade git+https://github.com/xtawb/deepjs      # 0.2.0 or newer
+python burp/build.py                                           # → burp/build/deepjs-burp.jar  (needs a JDK 17+)
+```
+
+Then in Burp: **Extensions → Add → Extension type: Java →** select
+`deepjs-burp.jar`. If the tab says the worker failed to start, set *Worker
+command* on the *Log / settings* tab to your Python, e.g.
+`"C:\Users\you\AppData\Local\Programs\Python\Python312\python.exe" -m deepjs serve`.
+
+A prebuilt jar is attached to each CI run (Actions → latest run → `deepjs-burp`).
+
+## Crawling
+
+`deepjs scan <site>` now crawls: it follows same-host links (`--crawl-depth`,
+default 2; `--max-pages`, default 40), reads `robots.txt` and sitemaps, turns
+HTML forms into endpoints, and visits the client-side routes it finds in the
+bundles — server-rendered apps ship different chunks per route. It never
+follows links that look state-changing (logout, delete, unsubscribe…), never
+leaves the target host unless you pass `--scope`, and `--no-crawl` restores
+single-page behaviour. Requests use a desktop-browser User-Agent by default
+because many CDNs refuse anything else (`--user-agent` to change it); when
+requests are refused anyway the report says so and how to get past it.
+
+Two things keep it from wasting requests. A single-page app answers every
+route with the same HTML shell, so DeepJS probes three routes and, if they come
+back identical to a page it already has, does not request the rest — the
+scripts are what matter and it has them. And if the server answers eight
+requests in a row with HTTP 5xx / 429 it stops and says so, instead of pushing
+an overloaded site further (`--delay`, `--threads` to go slower).
+
 ## What it finds
 
 **API calls** — `fetch`, axios (every form), jQuery, `XMLHttpRequest`, any
@@ -99,6 +154,13 @@ superagent, your own wrapper), request-config objects (`{url, method}` — RTK
 Query, axios configs), `WebSocket`, `EventSource`, `sendBeacon`. Each with its
 method, query-parameter names, body field names and header names when the call
 site shows them. Strings that only *look* like paths are listed separately.
+
+Service classes are followed: `this.host` is resolved inside its own class
+(class fields, constructor assignments, TypeScript's ES5 output), so Angular's
+`host = this.hostServer + "/rest/products"` … `this.http.get(`${this.host}/${id}/reviews`)`
+is reported as `GET /rest/products/{id}/reviews`, not `{host}/{id}/reviews`.
+When the base lives in another chunk (`environment.apiUrl`), the call is shown
+with the placeholder and completed once that chunk has been read.
 
 **Hidden chunks** — the webpack 4/5 (and Next.js) chunk-filename function is
 evaluated for every chunk id it knows; Vite/Rollup dynamic imports and Next.js
@@ -149,19 +211,35 @@ On real minified libraries (react-dom, vue, jquery, lodash, three.js, angular,
 axios, moment, the 3.3 MB aws-sdk) the tokenizer consumed every byte with no
 unbalanced brackets, reported zero secrets, and took about one second per MB.
 
+One real application, for scale: the public OWASP Juice Shop demo (Angular,
+3.1 MB of JavaScript in 23 files). 0.1.0 analysed the single page it was given.
+0.2.0 before class resolution reported 51 calls, 41 of them with an unresolved
+`{hostServer}` / `{host}` base and 13 of those with part of the path missing;
+with it, 92 calls, none with an unresolved base. That is one application
+and no ground truth for what was missed — an anecdote, not a benchmark.
+
 ## Limits
 
 - **Static only.** URLs computed at runtime from server responses, or built by
   code paths the evaluator does not model (`[a, b].join("/")`, a URL returned
   from a helper function), are missed or left as `{param}`.
 - **No full parser.** Identifiers are resolved only when a name has exactly one
-  constant string value in the file; in minified code that is deliberately
-  conservative, so some URLs keep a `{base}` placeholder instead of a host.
+  constant string value in the file (or, for `this.x`, one definition in its
+  class); in minified code that is deliberately conservative, so some URLs keep
+  a `{base}` placeholder instead of a host. For those, the full URL shown in
+  JSON and in Burp is a best guess (the site's own origin) — the placeholder in
+  the `url` field tells you it was guessed.
 - **A "string" endpoint may be a client route** — only call sites are certain.
 - **Source maps without `sourcesContent`** give file and package names, not code.
 - **Obfuscated bundles** (string-array rotation, control-flow flattening)
   defeat this kind of analysis.
 - JS/JSON/HTML only — no WebAssembly, no service-worker runtime behaviour.
+- **The crawler does not run JavaScript.** Pages that only exist after client-side
+  rendering are reached through routes and chunk maps, not by clicking. For an
+  app behind a login, pass your session (`-H "Cookie: …"`) or use the Burp extension.
+- **The Burp extension** is compiled against the Montoya API and its engine
+  bridge and UI models are tested outside Burp; behaviour inside every Burp
+  version is not something CI can test.
 
 ## How it works
 
@@ -184,13 +262,16 @@ targets ─► collect scripts ─► tokenize ─► endpoints · secrets · ho
 | `sourcemap.py` | map parsing, safe source recovery |
 | `hosts.py` | host extraction and classification |
 | `npmcheck.py` | public-registry existence check |
-| `engine.py` · `report.py` · `cli.py` | orchestration, output, command line |
+| `engine.py` · `report.py` · `cli.py` | crawling and orchestration, output, command line |
+| `serve.py` | stdin/stdout analysis worker for other tools |
+| `burp/` | the Burp Suite extension (Java, Montoya API) |
 
 ## Development
 
 ```bash
 python -m unittest discover -s tests -t .     # unit + end-to-end (a fake SPA served from localhost)
 python -m deepjs.corpus                       # accuracy corpus vs. the regex baseline
+python burp/build.py --test                   # build the Burp extension and run its harness
 ```
 
 ## License

@@ -28,6 +28,10 @@ def endpoints(code):
     return {(e.method, e.url) for e in extract(Program(code)).endpoints}
 
 
+def calls(code):
+    return {(e.method, e.url) for e in extract(Program(code)).endpoints if e.is_call}
+
+
 def secret_kinds(code, **kw):
     return {s.kind for s in scan_program(Program(code), "t.js", **kw)}
 
@@ -160,6 +164,48 @@ class EndpointTests(unittest.TestCase):
         ex = extract(Program('h(Link,{to:"/profile/settings"});h("a",{href:"/pricing"})'))
         self.assertEqual((ex.endpoints, ex.routes), ([], ["/pricing", "/profile/settings"]))
 
+    def test_this_properties_resolve_inside_their_own_class(self):
+        # Angular / esbuild: every service has its own `host`, built from a shared base
+        code = ('const env={production:!0,hostServer:"."};'
+                'var A=(()=>{class t{http=inject(H);hostServer=env.hostServer;host=this.hostServer+`/api/Feedbacks`;'
+                'find(a){return this.http.get(this.host+`/`,{params:a})}'
+                'del(a){return this.http.delete(`${this.host}/${a}`)}}return t})();'
+                'var B=(()=>{class t{http=inject(H);hostServer=env.hostServer;host=this.hostServer+`/rest/products`;'
+                'get(e){return this.http.get(`${this.host}/${e}/reviews`)}}return t})();')
+        self.assertEqual(calls(code), {("GET", "./api/Feedbacks/"), ("DELETE", "./api/Feedbacks/{param}"),
+                                           ("GET", "./rest/products/{param}/reviews")})
+        # constructor assignments, TypeScript's ES5 output (constructor function + prototype methods)
+        self.assertEqual(calls('class S{constructor(h){this.http=h;this.base="/api/v3/orders"}'
+                                   'one(id){return this.http.get(this.base+"/"+id)}}'),
+                         {("GET", "/api/v3/orders/{id}")})
+        es5 = ('var U=function(){function f(h){this.http=h;this.url="/api/users"}'
+               'f.prototype.all=function(){return this.http.get(this.url)};return f}();'
+               'var O=function(){function f(h){this.http=h;this.url="/api/orders"}'
+               'f.prototype.all=function(){return this.http.get(this.url)};return f}();')
+        self.assertEqual(calls(es5), {("GET", "/api/users"), ("GET", "/api/orders")})
+
+    def test_this_properties_are_never_guessed(self):
+        # two assignments in one class, a value from a parameter, a base from elsewhere: left unresolved
+        self.assertEqual(calls('class S{constructor(h,u){this.http=h;this.base="/api/a"}'
+                                   'swap(){this.base="/api/b"}one(){return this.http.get(this.base+"/x")}}'),
+                         {("GET", "{base}/x")})
+        self.assertEqual(calls('class S{constructor(h,u){this.http=h;this.base=u}'
+                                   'one(){return this.http.get(this.base+"/items")}}'), {("GET", "{base}/items")})
+        self.assertEqual(calls('class A{base="/api/a"}class B{constructor(h){this.http=h}'
+                                   'one(){return this.http.get(this.base+"/items")}}'), {("GET", "{base}/items")})
+
+    def test_strings_that_only_look_like_urls(self):
+        # URL-parser tests in polyfills, regex fragments, schema paths of a JSON validator
+        noise = ('var a="https://a",b="http://f",c="https://a/c%20d",d="/a/b",e="/(.+",'
+                 'f=errSchemaPath+"/additionalItems",g=e+"/d",h="https://"+x+y;')
+        self.assertEqual(endpoints(noise), set())
+        kept = 'var a="https://api.acme.io/v2/users",b=apiBase+"/orders",c="/internal/reports/export",d="http://localhost:3000/api";'
+        self.assertEqual(endpoints(kept), {("", "https://api.acme.io/v2/users"), ("", "{apiBase}/orders"),
+                                           ("", "/internal/reports/export"), ("", "http://localhost:3000/api")})
+        # the same shapes as the argument of a request are still reported
+        self.assertEqual(calls('fetch("https://"+host+"/v1/items");fetch(root+"/d")'),
+                         {("GET", "https://{host}/v1/items"), ("GET", "{root}/d")})
+
     def test_structure_beats_regex(self):
         ours, base = corpus.score(corpus.deepjs_extractor), corpus.score(corpus.regex_baseline)
         self.assertGreater(ours["url_recall"], base["url_recall"])
@@ -188,6 +234,14 @@ class SecretTests(unittest.TestCase):
         found = scan_program(Program(code), "t.js")
         self.assertEqual({s.kind for s in found}, {"FIREBASE_WEB_CONFIG", "STRIPE_PUBLISHABLE_KEY", "SENTRY_DSN"})
         self.assertTrue(all(s.public and s.severity == "info" for s in found))
+
+    def test_algolia_search_key_is_public_by_design(self):
+        hex32 = "9f2c71ab04de38c5" + "6b1e0a7d43f859c2"          # synthetic
+        found = scan_program(Program('var cfg={algolia:{appId:"1FCF9AYYAT",apiKey:"%s",indexName:"docs"}}' % hex32), "t.js")
+        self.assertEqual([(s.kind, s.severity, s.public) for s in found], [("ALGOLIA_SEARCH_KEY", "info", True)])
+        # the same value under the same name, without the Algolia siblings, is still a finding
+        alone = scan_program(Program('var cfg={apiKey:"%s"}' % hex32), "t.js")
+        self.assertEqual([(s.kind, s.public) for s in alone], [("HARDCODED_SECRET", False)])
 
     def test_supabase_roles(self):
         anon = jwt({"iss": "supabase", "ref": "abc", "role": "anon", "exp": int(time.time()) + 10 ** 8})

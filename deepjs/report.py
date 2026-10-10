@@ -63,7 +63,7 @@ def terminal(result: Result, limit: int = 25, colour: bool = False, reveal: bool
         out.append(st.bold(f"── {title} ({count}) " + "─" * max(4, 58 - len(title) - len(str(count)))))
 
     out.append(st.bold(f"DeepJS {__version__}") + st.dim(
-        f"  ·  {s.get('files', 0)} script(s), {s.get('bytes', 0) / 1e6:.1f} MB, "
+        f"  ·  {s.get('pages', 0)} page(s), {s.get('files', 0)} script(s), {s.get('bytes', 0) / 1e6:.1f} MB, "
         f"{s.get('requests', 0)} request(s), {s.get('seconds', 0)}s"))
 
     secrets = [x for x in result.secrets if not x.public]
@@ -141,7 +141,11 @@ def terminal(result: Result, limit: int = 25, colour: bool = False, reveal: bool
             out.append(st.dim(f"  {e}"))
     if not (secrets or calls or strings):
         out.append("")
-        out.append("  Nothing found. If the target is a single-page app, pass the page URL (not a script) so chunks can be discovered.")
+        if result.errors and not result.files:
+            out.append("  Nothing was analysed: the target could not be loaded (see the errors above).")
+        else:
+            out.append("  Nothing found. If the target is a single-page app, pass the page URL (not a script) so chunks "
+                       "can be discovered.")
     out.append("")
     return "\n".join(out)
 
@@ -151,7 +155,8 @@ def markdown(result: Result, reveal: bool = False) -> str:
     md: List[str] = [
         "# DeepJS report", "",
         f"**Targets:** {', '.join(f'`{t}`' for t in result.targets)}  ",
-        f"**Analysed:** {s.get('files', 0)} scripts ({s.get('bytes', 0) / 1e6:.1f} MB) in {s.get('seconds', 0)}s  ",
+        f"**Analysed:** {s.get('pages', 0)} pages, {s.get('files', 0)} scripts ({s.get('bytes', 0) / 1e6:.1f} MB) "
+        f"in {s.get('seconds', 0)}s  ",
         f"**Tool:** DeepJS {__version__}", "",
         "| | |", "|---|---|",
         f"| API calls | {s.get('api_calls', 0)} |",

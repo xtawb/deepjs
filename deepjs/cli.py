@@ -14,7 +14,8 @@ from deepjs import report
 
 EPILOG = """\
 examples:
-  deepjs scan https://app.example.com                  crawl the page, follow every chunk, read source maps
+  deepjs scan app.example.com                          crawl the site: pages, forms, robots, sitemaps, every chunk, source maps
+  deepjs scan https://app.example.com/login --no-crawl just this page and its scripts
   deepjs scan https://app.example.com -o out/          also write report.json / report.md / endpoints.txt / hosts.txt
   deepjs scan dist/ bundle.js traffic.har              analyse local files, a build directory, or a HAR capture
   deepjs scan -l urls.txt --proxy http://127.0.0.1:8080   send every request through Burp / ZAP
@@ -45,6 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sources", metavar="DIR", help="write original sources recovered from source maps here")
 
     g = s.add_argument_group("discovery")
+    g.add_argument("--no-crawl", action="store_true",
+                   help="analyse only the given page(s); do not follow links, forms, robots.txt or sitemaps")
+    g.add_argument("--max-pages", type=int, default=40, help="maximum pages to crawl (default 40)")
+    g.add_argument("--crawl-depth", type=int, default=2, help="link depth to follow from each target page (default 2)")
     g.add_argument("--max-files", type=int, default=300, help="maximum scripts to fetch (default 300)")
     g.add_argument("--depth", type=int, default=4, help="how many levels of script→script references to follow (default 4)")
     g.add_argument("--no-chunks", action="store_true", help="do not follow chunks named by the bundler runtime")
@@ -61,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     g = s.add_argument_group("network")
     g.add_argument("-H", "--header", metavar="'Name: value'", action="append", default=[], help="extra request header (repeatable)")
     g.add_argument("--proxy", metavar="URL", help="upstream proxy, e.g. http://127.0.0.1:8080")
+    g.add_argument("--user-agent", metavar="UA", help="User-Agent header (default: a current desktop Chrome)")
     g.add_argument("--insecure", action="store_true", help="do not verify TLS certificates")
     g.add_argument("--timeout", type=float, default=15.0, help="per-request timeout in seconds (default 15)")
     g.add_argument("--threads", type=int, default=8, help="concurrent requests (default 8)")
@@ -70,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--limit", type=int, default=25, help="rows per section in the terminal summary (default 25)")
     g.add_argument("-q", "--quiet", action="store_true", help="no progress messages")
     g.add_argument("--no-color", action="store_true", help="disable coloured output")
+
+    w = sub.add_parser("serve", help="analysis worker on stdin/stdout — used by the Burp Suite extension")
+    w.add_argument("--reveal", action="store_true", help="send full secret values instead of masked ones")
+    w.add_argument("--entropy", action="store_true", help="also report unlabelled random-looking strings")
 
     d = sub.add_parser("diff", help="compare two report.json files")
     d.add_argument("old")
@@ -107,6 +117,7 @@ def cmd_scan(args) -> int:
         max_files=args.max_files, depth=args.depth, threads=args.threads, timeout=args.timeout,
         delay=args.delay, headers=_headers(args.header), proxy=args.proxy, insecure=args.insecure,
         scope=args.scope, strict_scope=args.strict_scope, follow_chunks=not args.no_chunks,
+        crawl=not args.no_crawl, max_pages=args.max_pages, crawl_depth=args.crawl_depth, user_agent=args.user_agent,
         source_maps=not args.no_maps, probe_maps=not args.no_probe_maps, check_npm=args.check_npm,
         entropy=args.entropy, sources_dir=args.sources,
     )
@@ -153,7 +164,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
     argv = list(sys.argv[1:] if argv is None else argv)
     # `deepjs https://…` is shorthand for `deepjs scan https://…`
-    if argv and argv[0] not in ("scan", "diff", "-h", "--help", "--version"):
+    if argv and argv[0] not in ("scan", "diff", "serve", "-h", "--help", "--version"):
         argv.insert(0, "scan")
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -161,6 +172,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_scan(args)
     if args.command == "diff":
         return cmd_diff(args)
+    if args.command == "serve":
+        from deepjs.serve import serve
+        return serve(reveal=args.reveal, entropy=args.entropy)
     parser.print_help()
     return 0
 

@@ -21,7 +21,11 @@ from urllib.parse import urlsplit
 
 from deepjs import __version__
 
-DEFAULT_UA = f"DeepJS/{__version__} (+https://github.com/xtawb/deepjs)"
+# A plain tool User-Agent is refused outright by many CDNs and WAFs, which makes
+# the scan look empty. Override with --user-agent if you need to be identifiable.
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Safari/537.36")
+TOOL_UA = f"DeepJS/{__version__} (+https://github.com/xtawb/deepjs)"
 
 
 @dataclass
@@ -66,7 +70,12 @@ class Fetcher:
         self.timeout = timeout
         self.max_bytes = max_bytes
         self.delay = delay
-        self.headers = {"User-Agent": user_agent, "Accept": "*/*", "Accept-Encoding": "gzip, deflate"}
+        self.headers = {
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+        }
         self.headers.update(headers or {})
         self.requests = 0
         self._lock = threading.Lock()

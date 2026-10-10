@@ -17,6 +17,7 @@ them in the entry bundle. This module reads that index:
 
 from __future__ import annotations
 
+import html as html_lib
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -79,6 +80,58 @@ def scripts_from_html(html: str, base_url: str = "") -> HtmlScripts:
     return out
 
 
+# ── page links and forms (for the crawler) ─────────────────────────────────────
+
+_HREF = re.compile(r"<(?:a|area)\b[^>]*?\bhref\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
+_FRAME = re.compile(r"<i?frame\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
+_FORM = re.compile(r"<form\b([^>]*)>(.*?)</form\s*>", re.I | re.S)
+_FIELD = re.compile(r"<(?:input|select|textarea|button)\b[^>]*?\bname\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
+_NOT_A_PAGE = re.compile(r"^(?:mailto:|tel:|sms:|javascript:|data:|blob:|about:|#|whatsapp:|skype:)", re.I)
+
+
+@dataclass
+class Form:
+    method: str
+    action: str
+    fields: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PageLinks:
+    pages: List[str] = field(default_factory=list)
+    forms: List[Form] = field(default_factory=list)
+
+
+def links_from_html(html: str, base_url: str = "") -> PageLinks:
+    """Navigable links (absolute, fragment-free) and forms of an HTML page."""
+    out = PageLinks()
+    m = _BASE_TAG.search(html)
+    base = urljoin(base_url, m.group(1)) if m else base_url
+    seen: Set[str] = set()
+
+    def absolute(ref: str) -> str:
+        ref = html_lib.unescape(ref).strip()
+        if not ref or _NOT_A_PAGE.match(ref):
+            return ""
+        return (urljoin(base, ref) if base else ref).split("#", 1)[0]
+
+    for rx in (_HREF, _FRAME):
+        for m in rx.finditer(html):
+            url = absolute(m.group(1) or m.group(2) or m.group(3) or "")
+            if url and url not in seen:
+                seen.add(url)
+                out.pages.append(url)
+    for attrs, body in _FORM.findall(html):
+        a = {k.lower(): (x or y or z) for k, x, y, z in _ATTR.findall(attrs)}
+        action = absolute(a.get("action", "")) or base_url.split("#", 1)[0].split("?", 1)[0]
+        method = (a.get("method") or "GET").strip().upper()
+        names = [html_lib.unescape(x or y or z) for x, y, z in _FIELD.findall(body)]
+        if action:
+            out.forms.append(Form(method if method in ("GET", "POST", "PUT", "PATCH", "DELETE") else "GET",
+                                  action, list(dict.fromkeys(n for n in names if n))))
+    return out
+
+
 # ── webpack chunk-filename function ────────────────────────────────────────────
 
 def _static_map(p: Program, brace: int) -> Optional[Dict[str, str]]:
@@ -97,6 +150,33 @@ def _static_map(p: Program, brace: int) -> Optional[Dict[str, str]]:
     return out or None
 
 
+def _lookup_at(p: Program, i: int, param: Optional[str] = None) -> Optional[Tuple[Dict[str, str], str, int]]:
+    """
+    A chunk-map lookup starting at token `i`, in either spelling:
+        {1:"a"}[e]        ({1:"a"})[e]
+    Returns (map, parameter name, index after the lookup) or None.
+    """
+    brace = i
+    wrapped = False
+    if p.is_punc(i, "(") and p.is_punc(i + 1, "{") and p.pairs[i + 1] > 0 and p.pairs[i] == p.pairs[i + 1] + 1:
+        brace, wrapped = i + 1, True
+    if not p.is_punc(brace, "{"):
+        return None
+    close = p.pairs[brace]
+    if close < 0:
+        return None
+    j = close + (2 if wrapped else 1)
+    if not (p.is_punc(j, "[") and p.kind(j + 1) == ID and p.is_punc(j + 2, "]")):
+        return None
+    name = p.val(j + 1)
+    if param is not None and name != param:
+        return None
+    m = _static_map(p, brace)
+    if m is None:
+        return None
+    return m, name, j + 3
+
+
 def _term_bounds_left(p: Program, end: int) -> int:
     """Start index of the term that ends at token `end` (inclusive)."""
     t = p.tokens[end]
@@ -104,8 +184,11 @@ def _term_bounds_left(p: Program, end: int) -> int:
         o = p.pairs[end]
         if o < 0:
             return end
-        if t[V] == "]" and o > 0 and p.is_punc(o - 1, "}") and p.pairs[o - 1] >= 0:
-            return p.pairs[o - 1]                     # {map}[e]
+        if t[V] == "]" and o > 0:
+            if p.is_punc(o - 1, "}") and p.pairs[o - 1] >= 0:
+                return p.pairs[o - 1]                 # {map}[e]
+            if p.is_punc(o - 1, ")") and p.pairs[o - 1] >= 0:
+                return p.pairs[o - 1]                 # ({map})[e]
         return o
     if t[K] == ID:
         k = end
@@ -118,16 +201,13 @@ def _term_bounds_left(p: Program, end: int) -> int:
 def _term_end_right(p: Program, start: int) -> int:
     """Index after the term that starts at token `start`."""
     t = p.tokens[start]
-    if t[K] == PUNC and t[V] == "{":
+    if t[K] == PUNC and t[V] in ("{", "("):
         c = p.pairs[start]
         if c < 0:
             return start + 1
         if p.is_punc(c + 1, "[") and p.pairs[c + 1] > 0:
             return p.pairs[c + 1] + 1
         return c + 1
-    if t[K] == PUNC and t[V] == "(":
-        c = p.pairs[start]
-        return c + 1 if c > 0 else start + 1
     if t[K] == ID:
         k = start + 1
         while p.is_punc(k, ".") and p.kind(k + 1) == ID:
@@ -148,45 +228,51 @@ def _eval_chunk_expr(p: Program, a: int, b: int, param: str, chunk: str) -> Opti
         if t[K] == STR:
             out.append(t[V])
             i += 1
-        elif t[K] == NUM:
+            continue
+        if t[K] == NUM:
             out.append(str(t[V]))
             i += 1
-        elif t[K] == ID and t[V] == param and not p.is_punc(i + 1, "."):
+            continue
+        if t[K] == ID and t[V] == param and not p.is_punc(i + 1, "."):
             out.append(chunk)
             i += 1
-        elif t[K] == PUNC and t[V] == "{":
-            end = _term_end_right(p, i)
-            m = _static_map(p, i)
-            if m is None or chunk not in m:
-                return None
-            out.append(m[chunk])
-            i = end
-        elif t[K] == PUNC and t[V] == "(":
-            c = p.pairs[i]
-            if c < 0:
-                return None
-            # ({map}[e] || e)
-            if p.is_punc(i + 1, "{"):
-                m = _static_map(p, i + 1)
-                inner_end = _term_end_right(p, i + 1)
-                has_default = p.is_punc(inner_end, "||") or p.is_punc(inner_end, "??")
-                if m is not None and chunk in m:
-                    out.append(m[chunk])
-                elif has_default:
-                    out.append(chunk)
+            continue
+        if t[K] == PUNC and t[V] in ("{", "("):
+            look = _lookup_at(p, i, param)
+            if look is not None:                        # {map}[e]  /  ({map})[e]
+                m, _, end = look
+                if chunk not in m:
+                    return None
+                out.append(m[chunk])
+                i = end
+                continue
+            if t[V] == "(":
+                c = p.pairs[i]
+                if c < 0:
+                    return None
+                inner = _lookup_at(p, i + 1, param)
+                if inner is not None:                   # ({map}[e] || e)
+                    m, _, end = inner
+                    has_default = p.is_punc(end, "||") or p.is_punc(end, "??")
+                    if chunk in m:
+                        out.append(m[chunk])
+                    elif has_default:
+                        out.append(chunk)
+                    else:
+                        return None
                 else:
-                    return None
-            else:
-                inner = _eval_chunk_expr(p, i + 1, c, param, chunk)
-                if inner is None:
-                    return None
-                out.append(inner)
-            i = c + 1
-        elif t[K] == ID:
+                    sub = _eval_chunk_expr(p, i + 1, c, param, chunk)
+                    if sub is None:
+                        return None
+                    out.append(sub)
+                i = c + 1
+                continue
+            return None
+        if t[K] == ID:
             # public path (r.p) and friends contribute nothing we can know here
             i = _term_end_right(p, i)
-        else:
-            return None
+            continue
+        return None
     return "".join(out)
 
 
@@ -195,43 +281,40 @@ def webpack_chunks(p: Program) -> List[str]:
     found: List[str] = []
     seen_expr: Set[int] = set()
     for i in range(p.n - 3):
-        # anchor on a chunk map lookup:  {…}[e]
-        if not (p.is_punc(i, "}") and p.is_punc(i + 1, "[") and p.kind(i + 2) == ID and p.is_punc(i + 3, "]")):
+        if not (p.is_punc(i, "{") or (p.is_punc(i, "(") and p.is_punc(i + 1, "{"))):
             continue
-        brace = p.pairs[i]
-        if brace < 0:
+        look = _lookup_at(p, i)
+        if look is None:
             continue
-        m = _static_map(p, brace)
+        m, param, lookup_end = look
         if not m or len(m) > 5000:
             continue
-        param = p.val(i + 2)
         # grow the concatenation around the lookup
-        start = brace
-        if start > 0 and p.is_punc(start - 1, "(") and p.pairs[start - 1] > 0:
+        start = i
+        if start > 0 and p.is_punc(start - 1, "(") and p.pairs[start - 1] >= lookup_end:
             start -= 1                                  # ({map}[e] || e)
         while start >= 2 and p.is_punc(start - 1, "+"):
             start = _term_bounds_left(p, start - 2)
         end = _term_end_right(p, start)
         while p.is_punc(end, "+") and end + 1 < p.n:
             end = _term_end_right(p, end + 1)
-        if start in seen_expr:
+        if end < lookup_end or start in seen_expr:
             continue
         seen_expr.add(start)
         text_tokens = [p.tokens[k][V] for k in range(start, end) if p.tokens[k][K] == STR]
-        if not any(isinstance(s, str) and re.search(r"\.(?:m?js|css)$", s) for s in text_tokens):
+        if not any(isinstance(x, str) and re.search(r"\.(?:m?js|css)$", x) for x in text_tokens):
             continue                                    # not a filename expression
         ids: Set[str] = set()
         for k in range(start, end):
-            if p.is_punc(k, "{") and p.pairs[k] > 0:
-                mm = _static_map(p, k)
-                if mm:
-                    ids.update(mm.keys())
+            inner = _lookup_at(p, k, param)
+            if inner is not None:
+                ids.update(inner[0].keys())
         for cid in sorted(ids):
             name = _eval_chunk_expr(p, start, end, param, cid)
             if name and name.endswith((".js", ".mjs")) and len(name) < 300:
                 found.append(name)
                 if len(found) >= MAX_CHUNKS_PER_FILE:
-                    return found
+                    return list(dict.fromkeys(found))
     return list(dict.fromkeys(found))
 
 

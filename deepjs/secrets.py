@@ -268,6 +268,12 @@ def _near_firebase(p: Program, i: int) -> bool:
     return any(p.tokens[k][K] in (ID, STR) and p.tokens[k][V] in _FIREBASE_SIBLINGS for k in range(lo, hi))
 
 
+def _near_algolia(p: Program, i: int) -> bool:
+    lo, hi = max(0, i - 14), min(p.n, i + 14)
+    names = {str(p.tokens[k][V]).lower() for k in range(lo, hi) if p.tokens[k][K] in (ID, STR)}
+    return bool(names & {"appid", "applicationid", "algolia_app_id"}) and bool(names & {"indexname", "index_name"})
+
+
 def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secret]:
     """Find credentials in one tokenized file."""
     out: List[Secret] = []
@@ -315,6 +321,12 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
             continue
         label, score = classify(value, strong_key=strength == 2)
         if label in ("placeholder", "benign"):
+            continue
+        if re.fullmatch(r"[0-9a-f]{32}", value) and _near_algolia(p, i):
+            # {appId, apiKey, indexName}: what every site with Algolia search ships to the browser
+            add(Secret("ALGOLIA_SEARCH_KEY", "info", 0.8, value, key, file, p.line(i),
+                       "Algolia key next to appId / indexName — a search-only key is public by design. An admin key "
+                       "has the same shape: check its ACL in the Algolia dashboard.", True))
             continue
         if strength == 2:
             if label == "weak" and not re.search(r"[\d!@#$%^&*+=/\\|~?]", value):

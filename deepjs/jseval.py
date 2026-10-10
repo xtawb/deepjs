@@ -18,6 +18,7 @@ reused in every scope, and guessing would invent URLs that do not exist.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -72,6 +73,13 @@ class Program:
         # unknown pieces:  const url = `${API}/orders/${id}`;  fetch(url)
         self.templates: Dict[str, List[Part]] = {}
         self._assignments: Dict[str, int] = defaultdict(int)
+        # `this.name = …` and class fields `name = …`: name → [(position, value index)].
+        # Resolved per class, never file-wide: every service class has its own `this.host`.
+        self._this_defs: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        self._class_bodies: Set[int] = set()
+        self._this_cache: Dict[Tuple[str, int], Optional[List[Part]]] = {}
+        self._encl: Optional[List[int]] = None
+        self._collect_this()
         self._collect_parameters()
         self._collect_constants(final=False)
         self._collect_constants(final=True)   # second pass resolves constants built from constants
@@ -217,7 +225,7 @@ class Program:
         if kind == NUM:
             return [(False, str(val))], i + 1
         if kind == TPL:
-            return self._eval_template(val), i + 1
+            return self._eval_template(val, i, depth), i + 1
         if kind == PUNC and val == "(":
             close = self.pairs[i]
             if close < 0:
@@ -241,6 +249,11 @@ class Program:
         while (self.is_punc(j, ".") or self.is_punc(j, "?.")) and self.kind(j + 1) == ID:
             chain.append(self.val(j + 1))
             j += 2
+
+        if len(chain) == 2 and chain[0] == "this" and not (self.is_punc(j, "(") or self.is_punc(j, "[")):
+            own = self._this_value(chain[1], i, depth)
+            if own is not None:
+                return list(own), j
 
         resolved = self._resolve(chain)
         name = chain[-1]
@@ -300,7 +313,7 @@ class Program:
             return next(iter(vals))
         return None
 
-    def _eval_template(self, segments: List[object]) -> List[Part]:
+    def _eval_template(self, segments: List[object], at: int = -1, depth: int = 0) -> List[Part]:
         parts: List[Part] = []
         for seg in segments:
             if isinstance(seg, str):
@@ -309,6 +322,11 @@ class Program:
             expr = seg[1]
             if _SIMPLE_REF.match(expr):
                 chain = [p for p in re.split(r"\??\.", expr) if p]
+                if len(chain) == 2 and chain[0] == "this" and at >= 0:
+                    own = self._this_value(chain[1], at, depth)
+                    if own is not None:
+                        parts.extend(own)
+                        continue
                 val = self._resolve(chain)
                 if val is None and any(expr.startswith(r) for r in _ENV_ROOTS):
                     vals = self.props.get(chain[-1]) or self.consts.get(chain[-1])
@@ -354,6 +372,116 @@ class Program:
             else:
                 break
         return j
+
+    # ── `this.x` inside a class ───────────────────────────────────────────────
+
+    def _collect_this(self) -> None:
+        """Record where every `this.name = …` and class field `name = …` is."""
+        tokens, n, pairs = self.tokens, self.n, self.pairs
+        for i in range(n - 3):
+            t = tokens[i]
+            if t[K] != ID:
+                continue
+            if t[V] == "this":
+                if self.is_punc(i + 1, ".") and tokens[i + 2][K] == ID and self.is_punc(i + 3, "="):
+                    self._this_defs[tokens[i + 2][V]].append((i, i + 4))
+            elif t[V] == "class" and not (i > 0 and self.is_punc(i - 1, ".")):
+                # class [Name] [extends <expr>] {
+                j, limit = i + 1, min(n, i + 40)
+                while j < limit and not self.is_punc(j, "{"):
+                    if tokens[j][K] == PUNC:
+                        if tokens[j][V] in ("(", "[") and pairs[j] > j:
+                            j = pairs[j]
+                        elif tokens[j][V] in (";", "}", ")", ":", ",", "="):
+                            break
+                    j += 1
+                if j < limit and self.is_punc(j, "{") and pairs[j] > j:
+                    self._class_bodies.add(j)
+                    self._class_fields(j)
+        for defs in self._this_defs.values():
+            defs.sort()
+
+    def _class_fields(self, open_brace: int) -> None:
+        """Field definitions directly in a class body:  host = this.hostServer + "/api/Users";"""
+        tokens, pairs = self.tokens, self.pairs
+        close = pairs[open_brace]
+        i, at_member = open_brace + 1, True
+        while i < close:
+            t = tokens[i]
+            if t[K] == PUNC:
+                if t[V] in ("(", "[", "{") and pairs[i] > i:
+                    at_member = t[V] == "{"            # a method body ends a member
+                    i = pairs[i] + 1
+                    continue
+                at_member = t[V] == ";"
+            elif at_member and t[K] == ID:
+                k = i + 1 if t[V] == "static" and self.kind(i + 1) == ID else i
+                if self.is_punc(k + 1, "="):
+                    self._this_defs[tokens[k][V]].append((k, k + 2))
+                at_member = False
+            else:
+                at_member = False
+            i += 1
+
+    def _enclosing(self) -> List[int]:
+        """For every token, the index of the innermost `{` that contains it (-1 at top level)."""
+        if self._encl is None:
+            encl = [-1] * self.n
+            stack = [-1]
+            for i, t in enumerate(self.tokens):
+                if t[K] == PUNC:
+                    if t[V] == "{" and self.pairs[i] > i:
+                        encl[i] = stack[-1]
+                        stack.append(i)
+                        continue
+                    if t[V] == "}" and len(stack) > 1 and self.pairs[stack[-1]] == i:
+                        stack.pop()
+                encl[i] = stack[-1]
+            self._encl = encl
+        return self._encl
+
+    def _this_value(self, name: str, at: int, depth: int) -> Optional[List[Part]]:
+        """
+        What `this.<name>` holds at token `at`: the one definition in the class
+        (or constructor-function scope) around it. None when there is no
+        definition, more than one, or it is not a string with known text.
+        """
+        defs = self._this_defs.get(name)
+        if not defs or depth > MAX_DEPTH or not 0 <= at < self.n:
+            return None
+        encl = self._enclosing()
+        block, hops = encl[at], 0
+        while block >= 0 and hops < 10:
+            hops += 1
+            close = self.pairs[block]
+            lo = bisect_right(defs, (block, self.n))
+            hi = bisect_left(defs, (close, -1))
+            if hi - lo > 1:
+                return None
+            if hi - lo == 1:
+                key = (name, block)
+                if key in self._this_cache:
+                    return self._this_cache[key]
+                self._this_cache[key] = None             # guards  this.a = this.a + "…"
+                pos, value = defs[lo]
+                owner = encl[pos]
+                # outside a class, only a constructor function declared directly in this
+                # scope counts:  function F(){ this.host = … }  F.prototype.get = function(){ … }
+                if block in self._class_bodies or owner == block or (owner >= 0 and encl[owner] == block):
+                    parts, end = self.eval_expr(value, depth + 1)
+                    continues = end < self.n and self.tokens[end][K] == PUNC and \
+                        self.tokens[end][V] in ("?", "(", ".", "[", "||", "&&", "??")
+                    known = any(not is_var and text for is_var, text in parts)
+                    # host = env.apiRoot: nothing known, but `apiRoot` is the name another file may define
+                    alias = len(parts) == 1 and parts[0][0] and parts[0][1] != "param"
+                    if parts and not continues and (known or alias) \
+                            and sum(len(text) for _, text in parts) <= MAX_CONST_LEN:
+                        self._this_cache[key] = parts
+                return self._this_cache[key]
+            if block in self._class_bodies:
+                return None
+            block = encl[block]
+        return None
 
     # ── constants ─────────────────────────────────────────────────────────────
 
