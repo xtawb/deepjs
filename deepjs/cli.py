@@ -8,7 +8,7 @@ import os
 import sys
 from typing import Dict, List, Optional
 
-from deepjs import __version__
+from deepjs import __author__, __version__
 from deepjs.engine import Engine, Options
 from deepjs import report, update
 
@@ -26,6 +26,7 @@ examples:
 
 Only scan applications you own or are authorised to test.
 """
+EPILOG += f"\ndeepjs is made by {__author__} — https://github.com/xtawb/deepjs\n"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -86,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     u = sub.add_parser("update", help="show what the latest release changed and install it (asks first)")
     u.add_argument("-y", "--yes", action="store_true", help="install without asking")
+    u.add_argument("--changelog", action="store_true",
+                   help="show what the latest release changed even when it is the one installed")
+    u.add_argument("--no-color", action="store_true", help="disable coloured output")
 
     d = sub.add_parser("diff", help="compare two report.json files")
     d.add_argument("old")
@@ -185,7 +189,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "diff":
         return cmd_diff(args)
     if args.command == "update":
-        return update.run_update(assume_yes=args.yes)
+        return update.run_update(assume_yes=args.yes, colour=False if args.no_color else None, changelog=args.changelog)
     if args.command == "serve":
         from deepjs.serve import serve
         return serve(reveal=args.reveal, entropy=args.entropy)

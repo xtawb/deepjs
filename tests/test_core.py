@@ -676,6 +676,7 @@ class UpdateTests(unittest.TestCase):
         kwargs.setdefault("interactive", answer is not None)
         kwargs.setdefault("checkout", False)
         kwargs.setdefault("managed", False)
+        kwargs.setdefault("colour", False)
         code = update.run_update(out=out, current="0.4.0", fetch=fetch, ask=ask, run=run, **kwargs)
         return code, out.getvalue(), ran
 
@@ -728,6 +729,42 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual((code, ran, self.asked), (0, [], []))
         self.assertIn("git pull", text)
 
+    def test_update_says_whose_tool_it_is(self):
+        for version in ("9.0.0", "0.4.0"):                          # something newer, nothing newer
+            code, text, ran = self.updating(version=version)
+            self.assertEqual(text.splitlines()[1], "by xtawb · https://github.com/xtawb/deepjs")
+
+    def test_changelog_of_the_release_already_installed(self):
+        code, text, ran = self.updating(version="0.4.0", notes="## Fixes\n- one", answer="y")
+        self.assertNotIn("What changed", text)                      # nothing newer: one line and whose tool it is
+        code, text, ran = self.updating(version="0.4.0", notes="## Fixes\n- one", answer="y", changelog=True)
+        self.assertEqual((code, ran, self.asked), (0, [], []))
+        self.assertIn("0.4.0 is the latest release.\nby xtawb", text)
+        self.assertIn("What changed:\n  ## Fixes\n  - one\n\nRelease page: ", text)
+
+    def test_update_in_colour(self):
+        notes = "## Fixes\n- `deepjs update` is **quicker**\n- plain\x1b[31m\n\n```bash\npip install x\n```\nSee [the page](https://x.y)."
+        plain = self.updating(notes=notes)[1]
+        self.assertNotIn("\x1b", plain)                             # the default here: not a terminal
+        self.assertIn("  ## Fixes\n  - `deepjs update` is **quicker**\n  - plain[31m\n", plain)       # as written
+        self.assertIn("  ```bash\n  pip install x\n  ```\n", plain)
+
+        text = self.updating(notes=notes, answer="y", colour=True)[1]
+        bold, green, cyan, dim, off = "\x1b[1m", "\x1b[32m", "\x1b[36m", "\x1b[2m", "\x1b[0m"
+        self.assertTrue(text.startswith(f"{bold}{green}deepjs 9.0.0{off}{off} is available (this is 0.4.0).\n"
+                                        f"{dim}by xtawb · https://github.com/xtawb/deepjs{off}\n"))
+        self.assertIn(f"  {bold}{cyan}Fixes{off}{off}\n", text)                             # a heading, without its marks
+        self.assertIn(f"  {green}-{off} {cyan}deepjs update{off} is {bold}quicker{off}\n", text)
+        self.assertIn(f"  {green}-{off} plain[31m\n", text)                                # what the notes brought is not obeyed
+        self.assertIn(f"  {cyan}pip install x{off}\n", text)
+        self.assertNotIn("```", text)
+        self.assertIn("  See [the page](https://x.y).\n", text)
+        self.assertIn(f"{green}deepjs is now 9.0.0.{off}\n", text)
+        self.assertEqual(self.asked, ["Install it now? [y/N] "])    # the prompt stays plain: readline counts its width
+
+        failed = self.updating(notes=notes, assume_yes=True, status=2, colour=True)[1]
+        self.assertIn("\x1b[31mpip exited with status 2.", failed)
+
     def test_update_into_a_python_the_system_manages(self):
         # Kali, Debian, Ubuntu: pip refuses ("externally-managed-environment") unless it is told to go ahead
         code, text, ran = self.updating(answer="y", managed=True, installer="pip")
@@ -773,11 +810,13 @@ class UpdateTests(unittest.TestCase):
 
     def test_update_spellings(self):
         from deepjs import cli
-        for argv, yes in ((["update"], False), (["--update"], False), (["-update"], False),
-                          (["update", "--yes"], True), (["--update", "-y"], True)):
+        for argv, yes, colour, changelog in (
+                (["update"], False, None, False), (["--update"], False, None, False), (["-update"], False, None, False),
+                (["update", "--yes"], True, None, False), (["--update", "-y"], True, None, False),
+                (["update", "--no-color"], False, False, False), (["-update", "--changelog"], False, None, True)):
             with mock.patch.object(update, "run_update", return_value=0) as run:
                 self.assertEqual(cli.main(argv), 0)
-            run.assert_called_once_with(assume_yes=yes)
+            run.assert_called_once_with(assume_yes=yes, colour=colour, changelog=changelog)
 
 
 if __name__ == "__main__":

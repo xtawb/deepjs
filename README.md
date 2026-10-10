@@ -132,8 +132,10 @@ it sends nothing about the scan, and nothing is downloaded or installed.
 `--no-update-check` or `DEEPJS_NO_UPDATE_CHECK=1` turns it off.
 
 `deepjs update` (or `deepjs --update`) does the updating: it prints what the
-latest release changed and the exact `pip` command it is about to run, asks,
-and installs that release's tagged archive. `--yes` skips the question; without
+latest release changed — in colour in a terminal; `--no-color` or `NO_COLOR`
+for plain text — and the exact `pip` command it is about to run, asks,
+and installs that release's tagged archive. `deepjs update --changelog` shows
+what the latest release changed even when it is the one you have. `--yes` skips the question; without
 a terminal and without `--yes` it changes nothing. There is no silent
 self-update — a scanner that replaces its own code unasked is one whose
 results you cannot reproduce. A git checkout is left to `git pull`. In a

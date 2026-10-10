@@ -39,7 +39,29 @@ class Style:
 
 def use_colour(stream=None) -> bool:
     stream = stream or sys.stdout
-    return bool(getattr(stream, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
+    if not getattr(stream, "isatty", lambda: False)() or os.environ.get("NO_COLOR"):
+        return False
+    return os.name != "nt" or _windows_console_takes_colour(stream)
+
+
+def _windows_console_takes_colour(stream) -> bool:
+    """
+    An old Windows console prints escape sequences as text unless it is asked to interpret
+    them. Ask; where that cannot be done, there is no colour rather than a line of `←[1m`.
+    """
+    try:
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.windll.kernel32
+        handle = ctypes.c_void_p(msvcrt.get_osfhandle(stream.fileno()))
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        interprets = 0x0004                 # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(mode.value & interprets) or bool(kernel32.SetConsoleMode(handle, mode.value | interprets))
+    except Exception:
+        return False
 
 
 def _detail(ep) -> str:

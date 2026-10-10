@@ -36,10 +36,12 @@ from dataclasses import dataclass
 from importlib import metadata
 from typing import Callable, List, Optional, TextIO, Tuple
 
-from deepjs import __version__
+from deepjs import __author__, __version__
+from deepjs.report import Style, use_colour
 
 RELEASES_API = "https://api.github.com/repos/xtawb/deepjs/releases/latest"
 RELEASES_PAGE = "https://github.com/xtawb/deepjs/releases/latest"
+MADE_BY = f"by {__author__} · https://github.com/xtawb/deepjs"
 # a release is installed from its own tagged archive: no git needed, and not whatever `main` is today
 RELEASE_ARCHIVE = "https://github.com/xtawb/deepjs/archive/refs/tags/v{version}.zip"
 MAX_NOTES_LINES = 40
@@ -143,6 +145,40 @@ def printable(text: str, max_lines: int = MAX_NOTES_LINES) -> List[str]:
     return lines
 
 
+_HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*$")
+_BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_SPAN = re.compile(r"`([^`]+)`|\*\*([^*]+)\*\*")
+
+
+def _spans(text: str, st: Style) -> str:
+    return _SPAN.sub(lambda m: st.cyan(m.group(1)) if m.group(1) else st.bold(m.group(2)), text)
+
+
+def coloured(lines: List[str], st: Style) -> List[str]:
+    """
+    Release notes are Markdown. In colour they are shown as a terminal would show them: headings,
+    bullets, `code` and **emphasis** by colour instead of by their marks. Without colour they are
+    left exactly as written. `lines` come from `printable`, so no escape sequence in them is theirs.
+    """
+    if not st.on:
+        return lines
+    out, fenced = [], False
+    for line in lines:
+        if line.lstrip().startswith("```"):
+            fenced = not fenced             # the fence itself says nothing once its lines are coloured
+            continue
+        heading, bullet = _HEADING.match(line), _BULLET.match(line)
+        if fenced:
+            out.append(st.cyan(line))
+        elif heading:
+            out.append(st.bold(st.cyan(heading.group(1))))
+        elif bullet:
+            out.append(bullet.group(1) + st.green("-") + " " + _spans(bullet.group(2), st))
+        else:
+            out.append(_spans(line, st))
+    return out
+
+
 def install_command(version: str, into_system: bool = False) -> List[str]:
     """
     What `deepjs update` runs: pip, for the interpreter that is running deepjs, on that release's archive.
@@ -188,12 +224,16 @@ def is_source_checkout() -> bool:
 def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: str = __version__,
                fetch: Callable[[], Release] = fetch_release, ask: Callable[[str], str] = input,
                run: Callable[[List[str]], int] = subprocess.call, interactive: Optional[bool] = None,
-               checkout: Optional[bool] = None, managed: Optional[bool] = None, installer: Optional[str] = None) -> int:
+               checkout: Optional[bool] = None, managed: Optional[bool] = None, installer: Optional[str] = None,
+               colour: Optional[bool] = None, changelog: bool = False) -> int:
     """
     Look for a newer release, show what changed, and install it if the user agrees.
-    Returns a process exit status. The injectable pieces exist for the tests.
+    Returns a process exit status. `changelog`: show what the latest release changed even when
+    it is the one installed. `colour`: None decides by where `out` goes (a terminal, and
+    NO_COLOR not set). The other injectable pieces exist for the tests.
     """
     out = out or sys.stdout
+    st = Style(use_colour(out) if colour is None else colour)
 
     def say(line: str = "") -> None:
         print(line, file=out, flush=True)   # pip writes to the same place: keep the lines in order
@@ -201,24 +241,32 @@ def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: 
     try:
         release = fetch()
     except Exception as exc:
-        say(f"deepjs: could not ask GitHub for the latest release ({type(exc).__name__}). Nothing was changed.")
+        say(st.red(f"deepjs: could not ask GitHub for the latest release ({type(exc).__name__}). Nothing was changed."))
         return 1
     if not release.version:
-        say(f"deepjs: the latest release has no version this copy understands — see {RELEASES_PAGE}")
+        say(st.red(f"deepjs: the latest release has no version this copy understands — see {RELEASES_PAGE}"))
         return 1
+
+    def what_changed() -> None:
+        notes = coloured(printable(release.notes), st)
+        if notes:
+            say()
+            say(st.bold("What changed:"))
+            for line in notes:
+                say("  " + line)
+        say()
+        say("Release page: " + st.cyan(release.url if release.url.startswith("https://github.com/xtawb/deepjs/") else RELEASES_PAGE))
+
     if not is_newer(release.version, current):
-        say(f"deepjs {current} is the latest release.")
+        say(st.green(f"deepjs {current} is the latest release."))
+        say(st.dim(MADE_BY))
+        if changelog:
+            what_changed()
         return 0
 
-    say(f"deepjs {release.version} is available (this is {current}).")
-    notes = printable(release.notes)
-    if notes:
-        say()
-        say("What changed:")
-        for line in notes:
-            say("  " + line)
-    say()
-    say(f"Release page: {release.url if release.url.startswith('https://github.com/xtawb/deepjs/') else RELEASES_PAGE}")
+    say(st.bold(st.green(f"deepjs {release.version}")) + f" is available (this is {current}).")
+    say(st.dim(MADE_BY))
+    what_changed()
 
     if is_source_checkout() if checkout is None else checkout:
         say("This copy runs from a source checkout, so there is nothing for pip to replace: update it with `git pull`.")
@@ -226,7 +274,7 @@ def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: 
     into_system = externally_managed() if managed is None else managed
     if into_system:
         by = installed_by() if installer is None else installer
-        say("This Python belongs to the operating system (PEP 668): pip does not change it unless told to.")
+        say(st.yellow("This Python belongs to the operating system (PEP 668): pip does not change it unless told to."))
         if by != "pip":
             say(f"deepjs was put there by {by or 'something other than pip'}, so it is not pip's to replace. "
                 "Update it the way it was installed.")
@@ -235,7 +283,7 @@ def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: 
             "--no-deps, deepjs's own files are all that the command below replaces.")
     command = install_command(release.version, into_system)
     say("To install it, this will run:")
-    say("  " + as_typed(command))
+    say("  " + st.bold(as_typed(command)))
     if not assume_yes:
         unattended = "Nothing was changed. Run `deepjs update --yes` to install without being asked."
         if not (sys.stdin.isatty() if interactive is None else interactive):
@@ -255,7 +303,7 @@ def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: 
             return 0
     status = run(command)
     if status == 0:
-        say(f"deepjs is now {release.version}.")
+        say(st.green(f"deepjs is now {release.version}."))
     else:
-        say(f"pip exited with status {status}. deepjs may not have been updated — run the command above to see why.")
+        say(st.red(f"pip exited with status {status}. deepjs may not have been updated — run the command above to see why."))
     return status
