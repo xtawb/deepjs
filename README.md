@@ -130,7 +130,9 @@ latest release changed and the exact `pip` command it is about to run, asks,
 and installs that release's tagged archive. `--yes` skips the question; without
 a terminal and without `--yes` it changes nothing. There is no silent
 self-update — a scanner that replaces its own code unasked is one whose
-results you cannot reproduce. A git checkout is left to `git pull`.
+results you cannot reproduce. A git checkout is left to `git pull`. On Windows
+pip may end with a warning that it could not remove a temporary directory:
+that is the `deepjs.exe` still running the command, and the update is done.
 
 Two things keep it from wasting requests. A single-page app answers every
 route with the same HTML shell, so DeepJS probes three routes and, if they come
