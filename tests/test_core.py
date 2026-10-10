@@ -456,6 +456,70 @@ class ChunkTests(unittest.TestCase):
         self.assertEqual(found.inline, ['window.__CFG__={api:"/api/boot"}'])
 
 
+class HostileInputTests(unittest.TestCase):
+    """
+    Content comes from sites the user does not trust. Input written to make a
+    parser crawl must cost what its size costs: each case here took minutes, or
+    raised, before the engine was made linear. The bound is generous on purpose —
+    it separates "linear" from "quadratic", not a fast machine from a slow one.
+    """
+
+    def finishes(self, work, seconds=20.0):
+        started = time.time()
+        result = work()
+        self.assertLess(time.time() - started, seconds)
+        return result
+
+    def test_html_without_closing_brackets(self):
+        page = "<script>" + "<script src=" * 60000 + "<form action=" * 60000 + "<base href='" + "/" * 60000
+        found = self.finishes(lambda: chunks.scripts_from_html(page, "https://x.io/"))
+        self.assertEqual(found.inline, [])
+        self.assertEqual(self.finishes(lambda: chunks.links_from_html(page, "https://x.io/")).forms, [])
+        unclosed = "<script>a()" * 50000 + "<form>" * 50000
+        self.assertEqual(self.finishes(lambda: chunks.scripts_from_html(unclosed, "")).inline, [])
+        self.assertEqual(self.finishes(lambda: chunks.links_from_html(unclosed, "")).forms, [])
+
+    def test_html_is_still_read_the_same_way(self):
+        page = ('<SCRIPT SRC="a.js"></SCRIPT><script src=b.js><script>inline()</script>'
+                '<form action="/save?x=1" method=post><input name=a><select name="b"></select></form>'
+                '<a href="/next">n</a><iframe src="/frame"></iframe><form><input name=q></form>')
+        found = chunks.scripts_from_html(page, "https://x.io/dir/page")
+        self.assertEqual(found.urls, ["https://x.io/dir/a.js", "https://x.io/dir/b.js"])
+        self.assertEqual(found.inline, ["inline()"])          # the script with a src has no body of its own
+        links = chunks.links_from_html(page, "https://x.io/dir/page")
+        self.assertEqual(links.pages, ["https://x.io/next", "https://x.io/frame"])
+        self.assertEqual([(f.method, f.action, f.fields) for f in links.forms],
+                         [("POST", "https://x.io/save?x=1", ["a", "b"]), ("GET", "https://x.io/dir/page", ["q"])])
+
+    def test_long_chains_and_deep_nesting(self):
+        chain = "var u=" + '"/a"+' * 150000 + '"/b";fetch("/api/after")'
+        self.assertIn(("GET", "/api/after"), self.finishes(lambda: endpoints(chain)))
+        templates = "`a`+" * 40000 + "`b`;fetch('/api/after')"
+        self.assertIn(("GET", "/api/after"), self.finishes(lambda: endpoints(templates)))
+        self.finishes(lambda: scan_program(Program(templates), "t.js"))
+        nested = "`${`${`${`" * 4000 + "x" + "`}`}`}`" * 4000 + ";fetch('/api/after')"
+        self.finishes(lambda: tokenize(nested))               # no recursion error, however deep
+        keys = "f({" + "url:'/api/k'," * 40000 + "method:'POST'})"
+        self.assertEqual(self.finishes(lambda: calls(keys)), {("POST", "/api/k")})
+        many = "let abc='/api/base';" + "fetch(abc+'/x');" * 60000
+        self.assertEqual(self.finishes(lambda: calls(many)), {("GET", "/api/base/x")})
+
+    def test_a_value_appended_to_later_is_not_used(self):
+        far = "function f(){let base='/api/a';" + "noop();" * 3000 + "base+='/more';return fetch(base+'/x')}"
+        self.assertEqual(calls(far), {("GET", "{base}/x")})      # reported, but not as /api/a/x
+
+    def test_huge_comment_is_scanned_by_line(self):
+        key = "AK" + "IA" + "Q7ZP2MXL4RT9VB6N"
+        code = "/*\n" + ("x" * 200 + "\n") * 20000 + " staging: " + key + "\n*/\nvar a=1;"
+        found = self.finishes(lambda: scan_program(Program(code), "t.js"))
+        self.assertEqual([(s.kind, s.key, s.line) for s in found], [("AWS_ACCESS_KEY", "(comment)", 20002)])
+
+    def test_jwt_claims_of_the_wrong_type_are_ignored(self):
+        token = jwt({"iss": ["x"], "role": 5, "ref": "r"})
+        self.assertEqual(inspect_jwt(token, now=0)[:2], ("JWT_HARDCODED", "high"))
+        self.assertNotIn("issuer", inspect_jwt(token, now=0)[3])
+
+
 class UpdateTests(unittest.TestCase):
     """The update notice: no network here — the fetch is injected and the cache is a temporary file."""
 

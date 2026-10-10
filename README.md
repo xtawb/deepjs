@@ -117,21 +117,20 @@ It works in Burp Suite Community and Professional.
 [latest release](https://github.com/xtawb/deepjs/releases/latest), then in Burp:
 **Extensions → Add → Extension type: Java →** select the file.
 
-The analysis engine is inside the jar — there is nothing to install with pip.
-It is Python, so the machine needs a Python 3.11+ interpreter; the extension
-tries `python`, `py -3` and `python3` (`python3`, `python` on Linux and macOS).
-If none of them works, the *Log / settings* tab says why, once, and takes the
-full path of an interpreter under *Python*. Responses that passed while the
-engine was not running are analysed from the proxy history as soon as it is.
+That is all: the jar has no dependencies. Python is not needed — the extension
+carries its own analysis engine, a Java port of this repository's Python one,
+and `burp/parity.py` checks that the two report exactly the same thing (see
+[Two engines, one set of rules](#two-engines-one-set-of-rules)).
 
-The engine runs in a local process and never touches the network: every
-request the extension makes goes through Burp. When Burp starts, the extension
-asks GitHub — one request, through Burp — whether a newer release exists and
-says so in its status line; *Check for updates when Burp starts* turns that off.
+The engine never touches the network: every request the extension makes goes
+through Burp. Analysis runs on its own thread, so Burp's threads only queue
+work. When Burp starts, the extension asks GitHub — one request, through Burp —
+whether a newer release exists and says so in its status line; *Check for
+updates when Burp starts* turns that off.
 
 **Build it yourself** (JDK 17+): `gradle jar` → `build/libs/deepjs-burp.jar`,
 or `python burp/build.py --test`, which needs no Gradle and also runs the test
-harness against the jar it built.
+harness and the parity check against the jar it built.
 
 ## Crawling
 
@@ -298,11 +297,12 @@ second column filters such matches instead.
 - **The crawler does not run JavaScript.** Pages that only exist after client-side
   rendering are reached through routes and chunk maps, not by clicking. For an
   app behind a login, pass your session (`-H "Cookie: …"`) or use the Burp extension.
-- **The Burp extension needs a Python 3.11+ interpreter** on the machine. The
-  engine is in the jar, but it is Python, not Java.
 - **The Burp extension** is compiled against the Montoya API and tested against
   a mocked Burp API (the harness in `burp/test`); behaviour inside every Burp
   version is not something CI can test.
+- **The Burp extension analyses what Burp sees.** It does not crawl; the
+  command line does. HTML character references in form fields other than
+  numeric ones and `&amp; &lt; &gt; &quot; &apos; &nbsp;` are left as written.
 
 ## How it works
 
@@ -327,14 +327,39 @@ targets ─► collect scripts ─► tokenize ─► endpoints · secrets · ho
 | `npmcheck.py` | public-registry existence check |
 | `engine.py` · `report.py` · `cli.py` | crawling and orchestration, output, command line |
 | `serve.py` | stdin/stdout analysis worker for other tools |
-| `burp/` | the Burp Suite extension (Java, Montoya API) |
+| `burp/src/deepjs/engine` | the same analysis in Java, for the Burp extension |
+| `burp/src/deepjs/burp` | the Burp Suite extension (Montoya API) |
+
+### Two engines, one set of rules
+
+The command line is Python; a Burp extension that needs a Python interpreter
+is not a one-click install. So the analysis exists twice — `deepjs/*.py` and
+`burp/src/deepjs/engine/*.java` — and `burp/parity.py` keeps the two honest: it
+feeds identical input to both over the same line protocol and compares every
+record they produce. On the accuracy corpus, the end-to-end fixture, a
+generated set of credential / HTML / source-map shapes, seven real
+applications and nineteen well-known libraries (26 MB of JavaScript, 2,247
+records) the two agree on every record. The built-in sets run in CI on every
+push; a rule changed in one engine and not the other fails the build.
+
+### Input written to break a parser
+
+Both engines analyse content from sites the user does not trust. A page of a
+megabyte of unclosed `<form` tags, a 200,000-term string concatenation, five
+thousand nested template literals or a megabyte licence comment must cost
+what its size costs, not its square: HTML is read by a single-pass tag
+scanner, not by whole-document regular expressions; nesting is followed to a
+fixed depth; every regular expression that meets attacker-controlled text
+runs on a bounded length. The harness feeds such input to the extension on
+every build and requires that the engine is still answering afterwards.
 
 ## Development
 
 ```bash
 python -m unittest discover -s tests -t .     # unit + end-to-end (a fake SPA served from localhost)
 python -m deepjs.corpus                       # accuracy corpus vs. the regex baseline
-python burp/build.py --test                   # build the Burp extension and run its harness
+python burp/build.py --test                   # build the Burp extension; run its harness and the parity check
+python burp/parity.py --classpath burp/build/deepjs-burp.jar DIR…   # parity on real application files
 ```
 
 ## License

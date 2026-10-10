@@ -52,12 +52,10 @@ final class DeepJsTab extends JPanel {
 
         void clearAll();
 
-        void restartWorker(String commandLine);
-
         void settingsChanged();
     }
 
-    /** A table whose rows are keyed, so a row can be updated in place when the worker learns more. */
+    /** A table whose rows are keyed, so a row can be updated in place when the engine learns more. */
     static final class KeyedModel extends AbstractTableModel {
         private final String[] columns;
         private final Map<String, String[]> rows = new LinkedHashMap<>();
@@ -135,7 +133,6 @@ final class DeepJsTab extends JPanel {
     final JCheckBox raiseIssues = new JCheckBox("Report secrets as issues", true);
     final JCheckBox showStrings = new JCheckBox("Show string-only paths", true);
     final JCheckBox updateCheck = new JCheckBox("Check for updates when Burp starts", true);
-    final JTextField command = new JTextField(34);
 
     private final JLabel status = new JLabel("starting…");
     private final JTextArea other = new JTextArea();
@@ -273,13 +270,7 @@ final class DeepJsTab extends JPanel {
 
     private JPanel settingsPanel() {
         JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
-        top.add(new JLabel("Python:"));
-        top.add(command);
-        top.add(button("Apply / restart", e -> actions.restartWorker(command.getText())));
-        top.add(Box.createHorizontalStrut(10));
         top.add(updateCheck);
-        command.setToolTipText("The Python 3 interpreter that runs the analysis engine. Leave empty to find it automatically, "
-                + "or give its full path.");
         updateCheck.setToolTipText("One request to api.github.com, sent through Burp, to see whether a newer DeepJS has been released");
         updateCheck.addActionListener(e -> actions.settingsChanged());
         JPanel p = textPanel(log);

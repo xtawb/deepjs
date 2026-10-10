@@ -28,7 +28,5 @@ body field names and header names.</p>
 	<li>Select rows under "API calls" and choose "Send to Repeater".</li>
 </ol>
 
-<p>Requirements</p>
-<p>The analysis engine is written in Python and is included in the extension; it runs in a local process and makes no
-network requests of its own. A Python 3.11+ interpreter must be installed on the machine. It is found automatically, or
-its path can be set on the "Log / settings" tab.</p>
+<p>The extension has no dependencies. Analysis runs on its own thread and makes no network requests of its own: hidden
+scripts and source maps are requested through Burp, and only when those options are enabled.</p>

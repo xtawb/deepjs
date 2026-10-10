@@ -55,19 +55,16 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      # Compiles against the oldest supported Montoya API and runs the harness: the
-      # extension against a mocked Burp API, with the engine started from inside the jar.
+      # Compiles against the oldest supported Montoya API, runs the harness (the extension
+      # against a mocked Burp API, hostile input included) and the parity check: the Java
+      # engine must report exactly what the Python engine reports.
       - name: Build and test
         run: python burp/build.py --test
-      # The build PortSwigger's BApp Store uses. It must give a jar with the same engine in it.
+      # The build PortSwigger's BApp Store uses. Its jar must hold the same engine.
       - name: Build with Gradle
         run: gradle --no-daemon jar
-      - name: The Gradle jar carries the engine and can start it
-        run: |
-          unzip -l build/libs/deepjs-burp.jar | grep -q "engine/deepjs/__main__.py"
-          unzip -l build/libs/deepjs-burp.jar | grep -q "deepjs/burp/DeepJsExtension.class"
-          cd "$RUNNER_TEMP"
-          PYTHONPATH="$GITHUB_WORKSPACE/build/libs/deepjs-burp.jar/engine" python -m deepjs --version
+      - name: The Gradle jar agrees with the Python engine too
+        run: python burp/parity.py --classpath build/libs/deepjs-burp.jar
       - uses: actions/upload-artifact@v4
         with:
           name: deepjs-burp

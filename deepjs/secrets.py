@@ -31,6 +31,7 @@ from deepjs.jseval import Program, is_static, render
 from deepjs.lexer import ID, K, PUNC, STR, TPL, V
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
+MAX_SCANNED = 8192                  # longer strings are data, not credentials
 
 
 @dataclass
@@ -202,8 +203,9 @@ def inspect_jwt(token: str, now: Optional[float] = None) -> Optional[Tuple[str, 
     if header is None or payload is None or not ("alg" in header or "typ" in header):
         return None
     now = time.time() if now is None else now
-    role = str(payload.get("role", ""))
-    iss = str(payload.get("iss", ""))
+    # claims of the wrong type are ignored, not printed
+    role = payload.get("role") if isinstance(payload.get("role"), str) else ""
+    iss = payload.get("iss") if isinstance(payload.get("iss"), str) else ""
     exp = payload.get("exp")
     exp = float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
     when = time.strftime("%Y-%m-%d", time.gmtime(exp)) if exp else ""
@@ -214,7 +216,8 @@ def inspect_jwt(token: str, now: Optional[float] = None) -> Optional[Tuple[str, 
                     "Supabase service_role key — bypasses Row Level Security. Must never reach a browser.")
         return ("SUPABASE_ANON_KEY", "info", True,
                 "Supabase anon key — public by design; data protection depends on Row Level Security policies.")
-    if str(header.get("alg", "")).lower() == "none" or not m.group(3):
+    alg = header.get("alg") if isinstance(header.get("alg"), str) else ""
+    if alg.lower() == "none" or not m.group(3):
         return ("JWT_UNSIGNED", "medium", False, "Hardcoded JWT with no signature (alg=none).")
     if exp is not None and exp < now:
         return ("JWT_EXPIRED", "low", False, f"Hardcoded JWT, expired {when}.")
@@ -303,11 +306,11 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
         if kind == STR:
             text = tok[V]
         elif kind == TPL:
-            parts, _ = p.eval_expr(i)
+            parts = p.template_parts(i)
             text = render(parts) if is_static(parts) else "".join(s for s in tok[V] if isinstance(s, str))
         else:
             continue
-        if len(text) < 8 or len(text) > 8192:
+        if len(text) < 8 or len(text) > MAX_SCANNED:
             continue
         key = _key_context(p, i)
         line = 0
@@ -366,6 +369,13 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
 
     # comments survive in recovered sources and un-minified files
     for pos, text in p.lex.comments:
-        for tk, value, sev, pub, note in _typed_matches(text):
-            add(Secret(tk, sev, 0.85, value, "(comment)", file, p.lex.line_of(pos), note, pub))
+        if len(text) < 12:
+            continue
+        line = p.lex.line_of(pos)
+        # line by line, each bounded: a licence banner of megabytes costs what its lines cost
+        for n, row in enumerate(text.split("\n")):
+            if len(row) < 12:
+                continue
+            for tk, value, sev, pub, note in _typed_matches(row[:MAX_SCANNED]):
+                add(Secret(tk, sev, 0.85, value, "(comment)", file, line + n, note, pub))
     return out

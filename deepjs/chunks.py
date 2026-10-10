@@ -26,16 +26,89 @@ from urllib.parse import urljoin, urlsplit
 from deepjs.jseval import Program, is_static, render
 from deepjs.lexer import ID, K, NUM, PUNC, STR, TPL, V
 
-_SCRIPT_SRC = re.compile(r"<script\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s>]+))", re.I)
-_LINK_TAG = re.compile(r"<link\b[^>]*>", re.I)
 _ATTR = re.compile(r"\b([a-zA-Z\-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))")
-_INLINE_SCRIPT = re.compile(r"<script\b(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>", re.I | re.S)
+_SRC = re.compile(r"\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s>]+))", re.I)
+_SRC_OR_EMPTY = re.compile(r"\bsrc\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
+_HREF_ATTR = re.compile(r"\bhref\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
+_BASE_HREF = re.compile(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_NAME_ATTR = re.compile(r"\bname\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
+_HAS_SRC = re.compile(r"\bsrc\s*=", re.I)
 # a real file name: at least one name character before the extension (".chunk.js" alone is a suffix)
 _JS_FILE = re.compile(r"^(?:[\w.\-~@+%\[\]]*/)*[\w\[@~][\w.\-~@+%\[\]]*\.m?js(?:\?[\w.\-=&%]*)?$")
-_BASE_TAG = re.compile(r"<base\b[^>]*?\bhref\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
 MAX_CHUNKS_PER_FILE = 1500
 MAX_INLINE_BYTES = 2 * 1024 * 1024
+MAX_TAG = 65536                     # a start tag longer than this is not a tag
+MAX_CHUNK_NESTING = 40
+
+_OPENERS: Dict[str, "re.Pattern[str]"] = {}
+_CLOSERS: Dict[str, "re.Pattern[str]"] = {}
+
+
+def _tags(html: str, names: str) -> List[str]:
+    """
+    The attribute text of every `<name …>` start tag, in document order
+    (`names` is a regex alternation: "a|area").
+
+    One pass: the position of the next `>` is remembered between tags, so a
+    page with thousands of opening tags and no `>` costs one scan, not one per tag.
+    """
+    opener = _OPENERS.get(names) or _OPENERS.setdefault(names, re.compile(r"<(?:%s)\b" % names, re.I))
+    out: List[str] = []
+    pos, gt = 0, -2
+    while True:
+        m = opener.search(html, pos)
+        if m is None:
+            break
+        pos = m.end()
+        if gt < pos:
+            gt = html.find(">", pos)
+            if gt < 0:
+                break                         # no tag from here on is ever closed
+        if gt - pos <= MAX_TAG:
+            out.append(html[pos:gt])
+    return out
+
+
+def _elements(html: str, name: str, skip: Optional["re.Pattern[str]"] = None) -> List[Tuple[str, str]]:
+    """
+    (attribute text, content) of every `<name …>…</name>`, in document order.
+    A start tag whose attributes match `skip` is passed over, content and all.
+    Linear for the same reason as `_tags`, and because the first element left
+    unclosed ends the search: nothing after it can be closed either.
+    """
+    opener = _OPENERS.get(name) or _OPENERS.setdefault(name, re.compile(r"<(?:%s)\b" % name, re.I))
+    closer = _CLOSERS.get(name) or _CLOSERS.setdefault(name, re.compile(r"</%s\s*>" % name, re.I))
+    out: List[Tuple[str, str]] = []
+    pos, gt = 0, -2
+    while True:
+        m = opener.search(html, pos)
+        if m is None:
+            break
+        pos = m.end()
+        if gt < pos:
+            gt = html.find(">", pos)
+            if gt < 0:
+                break
+        if gt - pos > MAX_TAG:
+            continue
+        attrs = html[pos:gt]
+        if skip is not None and skip.search(attrs):
+            continue
+        end = closer.search(html, gt + 1)
+        if end is None:
+            break
+        out.append((attrs, html[gt + 1:end.start()]))
+        pos = end.end()
+    return out
+
+
+def _document_base(html: str, base_url: str) -> str:
+    for attrs in _tags(html, "base"):
+        m = _BASE_HREF.search(attrs)
+        if m:
+            return urljoin(base_url, m.group(1))
+    return base_url
 
 
 @dataclass
@@ -47,8 +120,7 @@ class HtmlScripts:
 def scripts_from_html(html: str, base_url: str = "") -> HtmlScripts:
     """External script URLs (absolute) and inline script bodies of an HTML page."""
     out = HtmlScripts()
-    m = _BASE_TAG.search(html)
-    base = urljoin(base_url, m.group(1)) if m else base_url
+    base = _document_base(html, base_url)
     seen: Set[str] = set()
 
     def push(ref: str) -> None:
@@ -60,16 +132,18 @@ def scripts_from_html(html: str, base_url: str = "") -> HtmlScripts:
             seen.add(url)
             out.urls.append(url)
 
-    for m in _SCRIPT_SRC.finditer(html):
-        push(m.group(1) or m.group(2) or m.group(3) or "")
-    for tag in _LINK_TAG.findall(html):
+    for attrs in _tags(html, "script"):
+        m = _SRC.search(attrs)
+        if m:
+            push(m.group(1) or m.group(2) or m.group(3) or "")
+    for tag in _tags(html, "link"):
         attrs = {k.lower(): (a or b or c) for k, a, b, c in _ATTR.findall(tag)}
         rel = attrs.get("rel", "").lower()
         href = attrs.get("href", "")
         if href and (rel in ("modulepreload",) or (rel in ("preload", "prefetch") and
                                                    (attrs.get("as", "").lower() == "script" or re.search(r"\.m?js(?:\?|$)", href)))):
             push(href)
-    for attrs, body in _INLINE_SCRIPT.findall(html):
+    for attrs, body in _elements(html, "script", skip=_HAS_SRC):
         kind = re.search(r"\btype\s*=\s*[\"']?([^\"'\s>]+)", attrs, re.I)
         mime = kind.group(1).lower() if kind else ""
         if mime in ("text/template", "text/html", "text/x-template", "text/css"):
@@ -82,10 +156,6 @@ def scripts_from_html(html: str, base_url: str = "") -> HtmlScripts:
 
 # ── page links and forms (for the crawler) ─────────────────────────────────────
 
-_HREF = re.compile(r"<(?:a|area)\b[^>]*?\bhref\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
-_FRAME = re.compile(r"<i?frame\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
-_FORM = re.compile(r"<form\b([^>]*)>(.*?)</form\s*>", re.I | re.S)
-_FIELD = re.compile(r"<(?:input|select|textarea|button)\b[^>]*?\bname\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.I)
 _NOT_A_PAGE = re.compile(r"^(?:mailto:|tel:|sms:|javascript:|data:|blob:|about:|#|whatsapp:|skype:)", re.I)
 
 
@@ -105,8 +175,7 @@ class PageLinks:
 def links_from_html(html: str, base_url: str = "") -> PageLinks:
     """Navigable links (absolute, fragment-free) and forms of an HTML page."""
     out = PageLinks()
-    m = _BASE_TAG.search(html)
-    base = urljoin(base_url, m.group(1)) if m else base_url
+    base = _document_base(html, base_url)
     seen: Set[str] = set()
 
     def absolute(ref: str) -> str:
@@ -115,17 +184,22 @@ def links_from_html(html: str, base_url: str = "") -> PageLinks:
             return ""
         return (urljoin(base, ref) if base else ref).split("#", 1)[0]
 
-    for rx in (_HREF, _FRAME):
-        for m in rx.finditer(html):
-            url = absolute(m.group(1) or m.group(2) or m.group(3) or "")
+    for names, attribute in (("a|area", _HREF_ATTR), ("i?frame", _SRC_OR_EMPTY)):
+        for attrs in _tags(html, names):
+            m = attribute.search(attrs)
+            url = absolute(m.group(1) or m.group(2) or m.group(3) or "") if m else ""
             if url and url not in seen:
                 seen.add(url)
                 out.pages.append(url)
-    for attrs, body in _FORM.findall(html):
+    for attrs, body in _elements(html, "form"):
         a = {k.lower(): (x or y or z) for k, x, y, z in _ATTR.findall(attrs)}
         action = absolute(a.get("action", "")) or base_url.split("#", 1)[0].split("?", 1)[0]
         method = (a.get("method") or "GET").strip().upper()
-        names = [html_lib.unescape(x or y or z) for x, y, z in _FIELD.findall(body)]
+        names = []
+        for field_attrs in _tags(body, "input|select|textarea|button"):
+            m = _NAME_ATTR.search(field_attrs)
+            if m:
+                names.append(html_lib.unescape(m.group(1) or m.group(2) or m.group(3) or ""))
         if action:
             out.forms.append(Form(method if method in ("GET", "POST", "PUT", "PATCH", "DELETE") else "GET",
                                   action, list(dict.fromkeys(n for n in names if n))))
@@ -216,8 +290,10 @@ def _term_end_right(p: Program, start: int) -> int:
     return start + 1
 
 
-def _eval_chunk_expr(p: Program, a: int, b: int, param: str, chunk: str) -> Optional[str]:
+def _eval_chunk_expr(p: Program, a: int, b: int, param: str, chunk: str, nesting: int = 0) -> Optional[str]:
     """Evaluate the filename expression over tokens [a, b) for one chunk id."""
+    if nesting > MAX_CHUNK_NESTING:
+        return None
     out: List[str] = []
     i = a
     while i < b:
@@ -261,7 +337,7 @@ def _eval_chunk_expr(p: Program, a: int, b: int, param: str, chunk: str) -> Opti
                     else:
                         return None
                 else:
-                    sub = _eval_chunk_expr(p, i + 1, c, param, chunk)
+                    sub = _eval_chunk_expr(p, i + 1, c, param, chunk, nesting + 1)
                     if sub is None:
                         return None
                     out.append(sub)
@@ -368,7 +444,7 @@ def discover(p: Program, script_url: str = "") -> Discovery:
             if manifest and s.startswith("/") and p.is_punc(i + 1, ":") and len(s) < 200:
                 out.routes.append(s)
         elif t[K] == TPL:
-            parts, _ = p.eval_expr(i)
+            parts = p.template_parts(i)
             if is_static(parts):
                 s = render(parts)
                 if 4 < len(s) < 300 and _JS_FILE.match(s):

@@ -1,15 +1,15 @@
 // Builds the Burp Suite extension:  gradle jar  →  build/libs/deepjs-burp.jar
 //
-// The jar holds the extension (burp/src) and, under engine/, the analysis engine
-// (the `deepjs` Python package of this repository). `python burp/build.py --test`
-// builds the same jar with nothing but a JDK and runs the test harness against it.
+// The jar holds the extension (deepjs.burp) and its analysis engine (deepjs.engine),
+// and has no dependencies. `python burp/build.py --test` builds the same jar with
+// nothing but a JDK, and runs the test harness and the engine parity check against it.
 
 plugins {
     id 'java'
 }
 
 group = 'io.github.xtawb'
-version = '0.3.0'
+version = '0.4.0'
 
 repositories {
     mavenCentral()
@@ -34,13 +34,6 @@ sourceSets {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release = 17
-}
-
-processResources {
-    from('deepjs') {
-        include '*.py'
-        into 'engine/deepjs'
-    }
 }
 
 jar {

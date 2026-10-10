@@ -20,7 +20,7 @@ from deepjs.endpoints import NOISE_HOSTS
 
 _URL_HOST = re.compile(
     r"(?:(?:https?|wss?|ftp)://|(?<![\w:/])//)"
-    r"((?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}|localhost|\d{1,3}(?:\.\d{1,3}){3})"
+    r"((?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.){1,30}[A-Za-z]{2,24}|localhost|\d{1,3}(?:\.\d{1,3}){3})"
     r"(?::(\d{2,5}))?"
 )
 _BARE_HOST = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}$")

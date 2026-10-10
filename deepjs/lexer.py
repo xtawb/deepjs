@@ -60,6 +60,7 @@ _BRACE_STOP = re.compile(r"[{}'\"`]")
 _QUOTED = re.compile(r"\"(?:[^\"\\\n]|\\[\s\S])*\"|'(?:[^'\\\n]|\\[\s\S])*'")
 
 MAX_REGEX_LEN = 4000
+MAX_TEMPLATE_DEPTH = 40             # `${`${…}`}` deeper than this is skipped, not followed
 
 
 def unescape(raw: str) -> str:
@@ -112,7 +113,7 @@ def _scan_regex(src: str, pos: int) -> int:
     return -1
 
 
-def _skip_braced(src: str, i: int) -> int:
+def _skip_braced(src: str, i: int, nesting: int = 0) -> int:
     """`i` is just after `${`. Returns the index of the matching `}` (or len)."""
     depth, n = 1, len(src)
     while i < n:
@@ -130,14 +131,17 @@ def _skip_braced(src: str, i: int) -> int:
                 return i
             i += 1
         elif c == "`":
-            _, i = _scan_template(src, i)
+            if nesting < MAX_TEMPLATE_DEPTH:
+                _, i = _scan_template(src, i, nesting + 1)
+            else:
+                i += 1
         else:
             q = _QUOTED.match(src, i)
             i = q.end() if q else i + 1
     return n
 
 
-def _scan_template(src: str, pos: int) -> Tuple[List[object], int]:
+def _scan_template(src: str, pos: int, nesting: int = 0) -> Tuple[List[object], int]:
     """
     `pos` is at a backtick. Returns (segments, end) where each segment is a
     decoded text `str` or an ``("expr", source)`` tuple for `${…}`.
@@ -166,7 +170,7 @@ def _scan_template(src: str, pos: int) -> Tuple[List[object], int]:
             return segs, i + 1
         elif c == "$" and src[i + 1:i + 2] == "{":
             flush()
-            j = _skip_braced(src, i + 2)
+            j = _skip_braced(src, i + 2, nesting)
             segs.append(("expr", src[i + 2:j].strip()))
             i = j + 1
         else:

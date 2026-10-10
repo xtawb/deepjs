@@ -35,6 +35,7 @@ _WRAPPERS = frozenset({
 _ENV_ROOTS = ("process.env.", "import.meta.env.", "window.env.", "window._env_.", "window.__env.")
 MAX_CONST_LEN = 2000
 MAX_DEPTH = 12
+MAX_REF_LEN = 300                   # a `${…}` longer than this is not a plain reference
 
 
 # A variable part that is one of a few known strings:  (feed ? "/feed" : "")
@@ -102,6 +103,9 @@ class Program:
         self._decl: Dict[str, List[int]] = defaultdict(list)
         self._param_pos: Dict[str, List[int]] = defaultdict(list)
         self._local_busy: Set[int] = set()
+        self._appended: Dict[str, List[int]] = defaultdict(list)      # name → positions of `name += …`
+        self._objects: Dict[int, Dict[str, Tuple[int, int]]] = {}
+        self._collect_appends()
         self._collect_this()
         self._collect_parameters()
         self._collect_constants(final=False)
@@ -153,10 +157,14 @@ class Program:
         ``{key: (value_start, value_end)}``. Shorthand `{a, b}` maps a key to
         its own token; methods and spreads are skipped.
         """
+        known = self._objects.get(open_brace)
+        if known is not None:
+            return known                      # asked for once per key of a large literal: read it once
         close = self.pairs[open_brace] if 0 <= open_brace < self.n else -1
         out: Dict[str, Tuple[int, int]] = {}
         if close < 0:
             return out
+        self._objects[open_brace] = out
         i = open_brace + 1
         while i < close:
             t = self.tokens[i]
@@ -231,11 +239,18 @@ class Program:
     @staticmethod
     def _merge(parts: List[Part]) -> List[Part]:
         out: List[Part] = []
+        run: List[str] = []                   # consecutive literal pieces, joined once
         for is_var, text in parts:
-            if not is_var and out and not out[-1][0]:
-                out[-1] = (False, out[-1][1] + text)
-            elif text or is_var:
-                out.append((is_var, text))
+            if not is_var:
+                if text:
+                    run.append(text)
+                continue
+            if run:
+                out.append((False, "".join(run)))
+                run = []
+            out.append((True, text))
+        if run:
+            out.append((False, "".join(run)))
         return out
 
     def _eval_term(self, i: int, depth: int) -> Tuple[List[Part], int]:
@@ -350,7 +365,7 @@ class Program:
                 parts.append((False, seg))
                 continue
             expr = seg[1]
-            if _SIMPLE_REF.match(expr):
+            if len(expr) <= MAX_REF_LEN and _SIMPLE_REF.match(expr):
                 chain = [p for p in re.split(r"\??\.", expr) if p]
                 if len(chain) == 2 and chain[0] == "this" and at >= 0:
                     own = self._this_value(chain[1], at, depth)
@@ -363,13 +378,19 @@ class Program:
                     val = next(iter(vals)) if vals and len(vals) == 1 else None
                 parts.append((False, val) if val is not None else (True, var_name(chain[-1])))
             else:
-                m = re.search(r"([A-Za-z_$][\w$]*)\s*\)*\s*$", expr)
-                inner = re.match(r"^(?:encodeURIComponent|encodeURI|String)\(\s*([\w$.?]+)\s*\)$", expr)
+                # only the end of a long expression is looked at: the name is there, and the search stays linear
+                m = re.search(r"([A-Za-z_$][\w$]*)\s*\)*\s*$", expr[-MAX_REF_LEN:])
+                inner = re.match(r"^(?:encodeURIComponent|encodeURI|String)\(\s*([\w$.?]+)\s*\)$", expr) \
+                    if len(expr) <= MAX_REF_LEN else None
                 if inner:
                     parts.append((True, var_name(re.split(r"\??\.", inner.group(1))[-1])))
                 else:
                     parts.append((True, var_name(m.group(1)) if m else "param"))
         return parts
+
+    def template_parts(self, i: int) -> List[Part]:
+        """The template literal at token `i` on its own — not the `a + b` chain it may be part of."""
+        return self._merge(self._eval_template(self.tokens[i][V], i, 0))
 
     def expr_start(self, i: int) -> int:
         """Walk left from token `i` to the first token of its `a + b + c` chain."""
@@ -557,11 +578,11 @@ class Program:
             lo = bisect_right(params, pos)
             if lo < len(params) and params[lo] < at:
                 return -1
-        for t in range(pos + 2, at):                      # r += "/more" — the value at `at` is not the one assigned
-            if self.tokens[t][K] == ID and self.tokens[t][V] == name and self.is_punc(t + 1, "+="):
+        appended = self._appended.get(name)               # r += "/more" — the value at `at` is not the one assigned
+        if appended:
+            lo = bisect_left(appended, pos + 2)
+            if lo < len(appended) and appended[lo] < at:
                 return -1
-            if t - pos > 4000:
-                break
         return pos
 
     def local_object(self, at: int) -> int:
@@ -655,6 +676,12 @@ class Program:
         return None
 
     # ── constants ─────────────────────────────────────────────────────────────
+
+    def _collect_appends(self) -> None:
+        tokens = self.tokens
+        for i in range(self.n - 1):
+            if tokens[i][K] == ID and tokens[i + 1][K] == PUNC and tokens[i + 1][V] == "+=":
+                self._appended[tokens[i][V]].append(i)
 
     def _collect_parameters(self) -> None:
         """Function / arrow / catch parameters are runtime values, never constants."""
