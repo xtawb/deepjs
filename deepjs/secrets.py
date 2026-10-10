@@ -155,6 +155,7 @@ _NEGATIVE_KEY = re.compile(
         |required|enabled|error|message|msg|text|input|form|reset\w*|confirm\w*|changed?|visible|mask|icon|class|style)
     | (?:^|_)(?:next|prev|previous|page|continuation|csrf|xsrf|nonce)_?(?:page_?)?token
     | (?:max|min|num|total|input|output|prompt|completion)_tokens? | tokeniz
+    | (?:^|_)token_(?:data|prec|table|groups?)$
     | (?:^|_)(?:label|title|placeholder|hint|help|text|message|msg|description|desc|name|type|regex|pattern|format
         |selector|class_?name|style|icon|event|action|route|path|url|uri|endpoint|href|src|error|warning)$
     | keyword | keyboard | keyframe | hotkey | passive | bypass | compass
@@ -268,6 +269,18 @@ def _near_firebase(p: Program, i: int) -> bool:
     return any(p.tokens[k][K] in (ID, STR) and p.tokens[k][V] in _FIREBASE_SIBLINGS for k in range(lo, hi))
 
 
+_PASSWORD_KEY = re.compile(r"(?:^|_)(?:pass(?:word|wd|phrase)?|pwd)(?:_|$|\d)")
+_SELF_DESCRIBING = re.compile(r"pass|pwd|secret|token|key|credential|login|sign|auth|user|enter|type|input|field|label|"
+                              r"placeholder|required|invalid|error|confirm|forgot|reset|change|show|hide|strength", re.I)
+
+
+def _passphrase_like(value: str) -> bool:
+    """One token of three or more capitalised words that does not describe a form field."""
+    if not re.fullmatch(r"[A-Za-z]{10,48}", value) or _SELF_DESCRIBING.search(value):
+        return False
+    return len(re.findall(r"[A-Z][a-z]+", value)) >= 3
+
+
 def _near_algolia(p: Program, i: int) -> bool:
     lo, hi = max(0, i - 14), min(p.n, i + 14)
     names = {str(p.tokens[k][V]).lower() for k in range(lo, hi) if p.tokens[k][K] in (ID, STR)}
@@ -319,7 +332,14 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
         value = re.sub(r"^(?:Bearer|Token|Basic|ApiKey)\s+", "", text.strip(), flags=re.I)
         if len(value) < 8 or len(value) > 512 or "\n" in value:
             continue
+        if re.fullmatch(r"[A-Za-z_$][\w$]*\([\w\[\], ]*\)", value):
+            continue                                   # a function signature:  OffchainLookup(address,string[],bytes)
         label, score = classify(value, strong_key=strength == 2)
+        if label == "benign" and strength == 2 and _PASSWORD_KEY.search(normalise_key(key)) and _passphrase_like(value):
+            # testingPassword = "IamUsedForTesting": words, but written like a password, under a password's name
+            add(Secret("HARDCODED_PASSWORD", "medium", 0.5, value, key, file, p.line(i),
+                       f"Passphrase-like value assigned to '{key[:60]}' — often a default or test account's password."))
+            continue
         if label in ("placeholder", "benign"):
             continue
         if re.fullmatch(r"[0-9a-f]{32}", value) and _near_algolia(p, i):

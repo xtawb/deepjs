@@ -26,12 +26,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from deepjs.jseval import Part, Program, is_static, render
+from deepjs.jseval import ALT, Part, Program, expand, is_static, render
 from deepjs.lexer import ID, K, PUNC, STR, TPL, V
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 _METHOD_CALLS = {"get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH", "delete": "DELETE",
-                 "del": "DELETE", "head": "HEAD", "options": "OPTIONS", "getJSON": "GET", "getScript": "GET"}
+                 "del": "DELETE", "head": "HEAD", "options": "OPTIONS", "getJSON": "GET", "getScript": "GET",
+                 # @nuxtjs/axios:  this.$axios.$get("/articles")
+                 "$get": "GET", "$post": "POST", "$put": "PUT", "$patch": "PATCH", "$delete": "DELETE", "$head": "HEAD"}
 _HTTPISH = re.compile(r"axios|https?|api|client|request|ajax|rest|fetch|service|backend|instance|superagent|^ky$|^got$|^\$$", re.I)
 _REQUEST_FUNCS = frozenset({"axios", "request", "ajax", "$http", "superagent", "ky", "got", "wretch", "needle"})
 
@@ -156,6 +158,9 @@ def _weak_noise(text: str) -> bool:
     return False
 
 
+_WRAPPER_URL = re.compile(r"^(https?://[^/{}?#\s]+(?:/[^{}?#\s]*[^/{}?#\s])?|/(?:api|rest|v\d+)(?:/v?\d+)?)\{[^{}]+\}$", re.I)
+
+
 def url_like(text: str, parts: List[Part], strong: bool, bare: bool = False) -> bool:
     """
     Is this built string a URL / path?  `strong` = it is the URL argument of a
@@ -238,9 +243,20 @@ class _Extractor:
     def add(self, url_parts: List[Part], method: str, kind: str, tok: int, conf: float,
             params: Optional[List[str]] = None, body: Optional[List[str]] = None,
             headers: Optional[List[str]] = None, strong: bool = True, bare: bool = False) -> bool:
+        if any(v and t.startswith(ALT) for v, t in url_parts):
+            # "/articles" + (feed ? "/feed" : ""): one endpoint per branch
+            variants = expand(url_parts)
+            if len(variants) > 1:
+                return any([self.add(v, method, kind, tok, conf, params, body, headers, strong, bare) for v in variants])
         text = render(url_parts)
         if not url_like(text, url_parts, strong, bare):
             return False
+        wrapper = _WRAPPER_URL.match(text) if kind != "string" else None
+        if wrapper and len(url_parts) == 2:
+            # get(path) { return this.http.get(`${environment.api_url}${path}`) }: an API client's
+            # own plumbing. What it tells us is the base URL; the real paths are at its call sites.
+            self.out.bases.append(wrapper.group(1))
+            return True
         base, query_names = split_query(normalise_url(text))
         if not base:
             return False
@@ -290,6 +306,11 @@ class _Extractor:
         if p.kind(i) == ID and p.val(i) == "new" and p.val(i + 1) in ("URLSearchParams", "FormData") \
                 and p.is_punc(i + 2, "("):
             i += 3
+        if p.kind(i) == ID and i + 1 >= b:
+            # post(url, n) where  n = {privateKey: t}  was assigned just before
+            literal = p.local_object(i)
+            if literal >= 0:
+                i = literal
         if p.is_punc(i, "{"):
             return [k for k in p.object_at(i).keys() if re.fullmatch(r"[\w.\-$\[\]]{1,60}", k)]
         return []
@@ -311,11 +332,18 @@ class _Extractor:
         if not url_parts:
             return False
         method = default_method
+        either: List[str] = []
+        has_method = False
         for name in ("method", "type", "verb"):
             if name in props:
+                has_method = True
                 m = self._static(*props[name]).upper()
                 if m in HTTP_METHODS:
                     method = m
+                else:
+                    # method: favorited ? "DELETE" : "POST"
+                    branches = p._literal_branches(props[name][0], -1, 0) or []
+                    either = [b.upper() for b in branches if b.upper() in HTTP_METHODS]
                 break
         params: List[str] = []
         for name in ("params", "query", "qs", "searchParams", "search"):
@@ -328,6 +356,12 @@ class _Extractor:
         headers = self._object_keys(*props["headers"]) if "headers" in props else []
         if not method and (body and kind != "config"):
             method = "POST"
+        if len(either) == 2:
+            return any([self.add(url_parts, m, kind, tok, conf, params, body, headers, bare=True) for m in either])
+        if not method and not has_method and not body and p.is_punc(brace - 1, "(") \
+                and not (p.kind(brace - 3) == ID and p.val(brace - 3) == "new"):
+            # request({url, headers}) with no method: GET in axios, fetch-likes and jQuery alike
+            method, conf = "GET", min(conf, 0.75)
         return self.add(url_parts, method, kind, tok, conf, params, body, headers, bare=bool(method))
 
     # ── passes ────────────────────────────────────────────────────────────────
@@ -374,6 +408,12 @@ class _Extractor:
         # fetch(url, {method, headers, body})
         if name == "fetch" and (not member or receiver in ("window", "self", "globalThis", "this", "global")):
             url = self._eval_range(a0, b0)
+            if receiver == "this":
+                # a class's own fetch(module, params) (ethers' EtherscanProvider): only an unmistakable URL counts
+                literal, text = "".join(t for v, t in url if not v), render(url)
+                if not (literal.startswith(("/", "http://", "https://", "//")) or
+                        (text.startswith("{") and "}/" in text) or _APIISH_PREFIX.match(literal)):
+                    return
             if len(args) > 1 and p.is_punc(args[1][0], "{"):
                 if self._from_config(args[1][0], "fetch", i, url, default_method="GET", conf=0.92):
                     return
@@ -382,7 +422,8 @@ class _Extractor:
 
         # client.get("/x") · axios.post(url, data, cfg) · $.getJSON(…) · this.http.put(…)
         if member and name in _METHOD_CALLS:
-            httpish = bool(_HTTPISH.search(receiver)) or (p.is_punc(i - 2, ")") if member else False)
+            httpish = bool(_HTTPISH.search(receiver)) or (p.is_punc(i - 2, ")") if member else False) \
+                or name.startswith("$")
             url = self._eval_range(a0, b0)
             if not url:
                 return

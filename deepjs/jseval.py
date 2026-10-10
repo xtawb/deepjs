@@ -37,8 +37,26 @@ MAX_CONST_LEN = 2000
 MAX_DEPTH = 12
 
 
+# A variable part that is one of a few known strings:  (feed ? "/feed" : "")
+ALT = "\x00alt\x01"
+
+
 def render(parts: List[Part]) -> str:
-    return "".join("{" + t + "}" if is_var else t for is_var, t in parts)
+    return "".join(("{param}" if t.startswith(ALT) else "{" + t + "}") if is_var else t for is_var, t in parts)
+
+
+def expand(parts: List[Part], limit: int = 6) -> List[List[Part]]:
+    """Every string `parts` can be when it contains either/or pieces; `[parts]` when it has none."""
+    out: List[List[Part]] = [[]]
+    for is_var, text in parts:
+        if is_var and text.startswith(ALT):
+            choices = text[len(ALT):].split("\x01")
+            if len(out) * len(choices) <= limit:
+                out = [o + [(False, c)] for o in out for c in choices]
+                continue
+            text = "param"
+        out = [o + [(is_var, text)] for o in out]
+    return [Program._merge(o) for o in out]
 
 
 def is_static(parts: List[Part]) -> bool:
@@ -79,6 +97,11 @@ class Program:
         self._class_bodies: Set[int] = set()
         self._this_cache: Dict[Tuple[str, int], Optional[List[Part]]] = {}
         self._encl: Optional[List[int]] = None
+        # every `name = …` (declaration or assignment) and every parameter, by position:
+        # a local is resolved from the nearest assignment that is in scope
+        self._decl: Dict[str, List[int]] = defaultdict(list)
+        self._param_pos: Dict[str, List[int]] = defaultdict(list)
+        self._local_busy: Set[int] = set()
         self._collect_this()
         self._collect_parameters()
         self._collect_constants(final=False)
@@ -233,7 +256,10 @@ class Program:
             inner, end = self.eval_expr(i + 1, depth + 1)
             if inner and end == close:
                 return inner, close + 1
-            # (a || "/fallback"), (cond ? x : y): an opaque value
+            branches = self._literal_branches(i + 1, close, depth)
+            if branches is not None:
+                return [(True, ALT + "\x01".join(branches))], close + 1      # (cond ? "/feed" : "")
+            # (a || "/fallback"), (cond ? x : fn()): an opaque value
             return [(True, "param")], close + 1
         if kind == ID:
             return self._eval_reference(i, depth)
@@ -254,6 +280,10 @@ class Program:
             own = self._this_value(chain[1], i, depth)
             if own is not None:
                 return list(own), j
+        if len(chain) == 1 and not (self.is_punc(j, "(") or self.is_punc(j, "[")):
+            local = self._local_value(chain[0], i, depth)
+            if local is not None:
+                return list(local), j
 
         resolved = self._resolve(chain)
         name = chain[-1]
@@ -483,6 +513,147 @@ class Program:
             block = encl[block]
         return None
 
+    # ── locals ────────────────────────────────────────────────────────────────
+
+    def _local_value(self, name: str, at: int, depth: int) -> Optional[List[Part]]:
+        """
+        let r = this.host + "/submitKey", n = {…};  return this.http.post(r, n)
+
+        The value of the nearest earlier `name = …` that is in scope at `at`.
+        None when there is none, when a parameter called `name` is declared in
+        between (it may shadow it), when it is appended to afterwards, or when
+        the value is not a string with known text.
+        """
+        if depth > MAX_DEPTH:
+            return None
+        pos = self._local_decl(name, at)
+        if pos < 0 or pos in self._local_busy:
+            return None
+        self._local_busy.add(pos)
+        try:
+            return self._assigned(pos + 2, depth)
+        finally:
+            self._local_busy.discard(pos)
+
+    def _local_decl(self, name: str, at: int) -> int:
+        """Position of the nearest earlier `name = …` in scope at `at`, or -1."""
+        decls = self._decl.get(name)
+        if not decls:
+            return -1
+        k = bisect_left(decls, at) - 1
+        if k < 0:
+            return -1
+        pos = decls[k]
+        if len(name) <= 2 and at - pos > 2500:
+            return -1
+        encl = self._enclosing()
+        block, hops, home = encl[at], 0, encl[pos]
+        while block != home:                              # the assignment's block must enclose the use
+            if block < 0 or hops >= 8:
+                return -1
+            block, hops = encl[block], hops + 1
+        params = self._param_pos.get(name)
+        if params:
+            lo = bisect_right(params, pos)
+            if lo < len(params) and params[lo] < at:
+                return -1
+        for t in range(pos + 2, at):                      # r += "/more" — the value at `at` is not the one assigned
+            if self.tokens[t][K] == ID and self.tokens[t][V] == name and self.is_punc(t + 1, "+="):
+                return -1
+            if t - pos > 4000:
+                break
+        return pos
+
+    def local_object(self, at: int) -> int:
+        """If the identifier at `at` was assigned an object literal in scope, the index of its `{`; else -1."""
+        if self.kind(at) != ID:
+            return -1
+        pos = self._local_decl(str(self.val(at)), at)
+        return pos + 2 if pos >= 0 and self.is_punc(pos + 2, "{") else -1
+
+    def _assigned(self, value: int, depth: int) -> Optional[List[Part]]:
+        parts, end = self.eval_expr(value, depth + 1)
+        nxt = self.tokens[end] if end < self.n else None
+        if nxt is not None and nxt[K] == PUNC and nxt[V] in ("?", "&&", "||", "??", ">", "<", "===", "==", "!==", "!="):
+            suffix = self._query_suffix(value, depth)
+            if suffix is not None:
+                return suffix
+            branches = self._literal_branches(value, -1, depth)            # u = feed ? "/articles/feed" : "/articles"
+            return [(True, ALT + "\x01".join(branches))] if branches else None
+        if nxt is not None and nxt[K] == PUNC and nxt[V] in ("(", ".", "["):
+            return None
+        if parts and any(not is_var and text for is_var, text in parts) \
+                and sum(len(text) for _, text in parts) <= MAX_CONST_LEN:
+            return parts
+        return None
+
+    def _ternary(self, start: int, close: int) -> Tuple[int, int, int]:
+        """(index of `?`, index of `:`, end) of the conditional starting at `start`; -1s when it is not one."""
+        i, question, colon, guard = start, -1, -1, 0
+        limit = close if close >= 0 else self.n
+        while i < limit and guard < 400:
+            guard += 1
+            t = self.tokens[i]
+            if t[K] == PUNC:
+                v = t[V]
+                if v in ("(", "[", "{") and self.pairs[i] > i:
+                    i = self.pairs[i] + 1
+                    continue
+                if v in (",", ";", ")", "]", "}"):
+                    break
+                if v == "?" and question < 0:
+                    question = i
+                elif v == ":" and question >= 0 and colon < 0:
+                    colon = i
+            i += 1
+        return (question, colon, i) if question >= 0 and colon >= 0 and (close < 0 or i == close) else (-1, -1, -1)
+
+    def _literal_branches(self, start: int, close: int, depth: int) -> Optional[List[str]]:
+        """The two strings of  cond ? "a" : "b"  when both are constants (one may be empty) and they differ."""
+        if depth > MAX_DEPTH:
+            return None
+        question, colon, end = self._ternary(start, close)
+        if question < 0:
+            return None
+        first, e1 = self.eval_expr(question + 1, depth + 1)
+        second, e2 = self.eval_expr(colon + 1, depth + 1)
+        if e1 != colon or e2 != end or any(v for v, _ in first + second):
+            return None
+        a, b = render(first), render(second)
+        if a == b or len(a) > 200 or len(b) > 200 or "\x00" in a + b or "\x01" in a + b:
+            return None
+        return [a, b]
+
+    def _query_suffix(self, value: int, depth: int) -> Optional[List[Part]]:
+        """t = fields && fields.length ? `?fields=${fields.join(",")}` : ""   →   ?fields={param}"""
+        i, question, colon, guard = value, -1, -1, 0
+        while i < self.n and guard < 400:
+            guard += 1
+            t = self.tokens[i]
+            if t[K] == PUNC:
+                v = t[V]
+                if v in ("(", "[", "{") and self.pairs[i] > i:
+                    i = self.pairs[i] + 1
+                    continue
+                if v in (",", ";", ")", "]", "}"):
+                    break
+                if v == "?" and question < 0:
+                    question = i
+                elif v == ":" and question >= 0 and colon < 0:
+                    colon = i
+            i += 1
+        if question < 0 or colon < 0:
+            return None
+        end = i
+        first, e1 = self.eval_expr(question + 1, depth + 1)
+        second, e2 = self.eval_expr(colon + 1, depth + 1)
+        if e1 != colon or e2 != end:
+            return None
+        branches = [b for b in (first, second) if render(b)]
+        if branches and all(render(b)[:1] in ("?", "&") and not b[0][0] for b in branches):
+            return branches[0]
+        return None
+
     # ── constants ─────────────────────────────────────────────────────────────
 
     def _collect_parameters(self) -> None:
@@ -504,6 +675,7 @@ class Program:
                 elif tk[K] == ID and depth <= 1:
                     self.tainted.add(tk[V])
                     self.params.add(tk[V])
+                    self._param_pos[tk[V]].append(k)
 
         for i in range(n):
             t = tokens[i]
@@ -521,6 +693,7 @@ class Program:
                 if p[K] == ID:
                     self.tainted.add(p[V])
                     self.params.add(p[V])
+                    self._param_pos[p[V]].append(i - 1)
                 elif p[K] == PUNC and p[V] == ")" and self.pairs[i - 1] >= 0:
                     taint_group(self.pairs[i - 1])
             elif t[K] == PUNC and t[V] == "(" and i > 0 and tokens[i - 1][K] == ID \
@@ -542,6 +715,10 @@ class Program:
                 continue
             op = nxt[V]
             is_prop = False
+            if op == "+=" and kind == ID:
+                # appended to afterwards: whatever it was assigned is not its final value
+                (self.tainted_props if i > 0 and self.is_punc(i - 1, ".") else self.tainted).add(str(t[V]))
+                continue
             if op == "=" and kind == ID:
                 is_prop = i > 0 and self.is_punc(i - 1, ".")
             elif op == ":" and i > 0 and tokens[i - 1][K] == PUNC and tokens[i - 1][V] in ("{", ","):
@@ -553,6 +730,8 @@ class Program:
             parts: List[Part] = []
             if final and not is_prop:
                 self._assignments[name] += 1
+                if op == "=" and kind == ID:
+                    self._decl[name].append(i)
             if tokens[i + 2][K] in (STR, TPL, ID):
                 parts, end = self.eval_expr(i + 2)
                 # the value must end the expression: a ternary / call continues past it

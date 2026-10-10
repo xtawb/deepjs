@@ -194,6 +194,52 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(calls('class A{base="/api/a"}class B{constructor(h){this.http=h}'
                                    'one(){return this.http.get(this.base+"/items")}}'), {("GET", "{base}/items")})
 
+    # Each of the next five tests is a pattern DeepJS 0.2.0 missed in the comparison with JS Miner
+    # on real applications (OWASP Juice Shop and RealWorld front-ends).
+
+    def test_local_variables_are_followed(self):
+        code = ('class W{http=inject(H);host="/rest/web3";'
+                'submitKey(t){let r=this.host+`/submitKey`,n={privateKey:t};return this.http.post(r,n)}'
+                'verify(t){let r=this.host+`/walletNFTVerify`,n={walletAddress:t};return this.http.post(r,n)}}')
+        eps = {(e.method, e.url): e for e in extract(Program(code)).endpoints if e.is_call}
+        self.assertEqual(set(eps), {("POST", "/rest/web3/submitKey"), ("POST", "/rest/web3/walletNFTVerify")})
+        self.assertEqual(eps[("POST", "/rest/web3/submitKey")].body, ["privateKey"])
+        # a parameter of the same name in between, or `+=`, and the value is no longer known
+        self.assertEqual(calls('let u="/api/a";items.forEach(u=>fetch(u+"/x"))'), {("GET", "{param}/x")})
+        self.assertEqual(calls('function f(){let u="/api/a";u+="/b";return fetch(u)}'), set())
+
+    def test_conditional_pieces_give_one_endpoint_per_branch(self):
+        self.assertEqual(calls('api.get("/articles"+("feed"===t.type?"/feed":""),{params:q})'),
+                         {("GET", "/articles"), ("GET", "/articles/feed")})
+        self.assertEqual(calls('api.post("/users"+("login"===t?"/login":""),{user:n})'),
+                         {("POST", "/users"), ("POST", "/users/login")})
+        self.assertEqual(calls('function f(a){const u=a?"/api/v2/items/archived":"/api/v2/items";return fetch(u)}'),
+                         {("GET", "/api/v2/items/archived"), ("GET", "/api/v2/items")})
+        # an optional query string held in a variable
+        eps = extract(Program('class U{http=inject(H);who(e){let t=e&&e.length>0?`?fields=${e.join(",")}`:``;'
+                              'return this.http.get("/rest/user/whoami"+t)}}')).endpoints
+        self.assertEqual([(e.method, e.url, e.params) for e in eps if e.is_call], [("GET", "/rest/user/whoami", ["fields"])])
+
+    def test_request_configs_without_a_fixed_method(self):
+        self.assertEqual(calls('const d=await Qe({headers:i,method:r?"DELETE":"POST",url:`api/articles/${a}/favorite`})'),
+                         {("DELETE", "api/articles/{param}/favorite"), ("POST", "api/articles/{param}/favorite")})
+        self.assertEqual(calls('const d=await Qe({headers:i,url:`api/profiles/${a}`})'), {("GET", "api/profiles/{param}")})
+        self.assertEqual(calls('this.$axios.$get("/articles/feed",{params:{limit:r}});o.$post("/articles",{article:t})'),
+                         {("GET", "/articles/feed"), ("POST", "/articles")})
+
+    def test_api_client_wrappers_give_a_base_not_an_endpoint(self):
+        ex = extract(Program('const env={api_url:"https://conduit.acme.io/api"};'
+                             'class Api{get(p){return this.http.get(`${env.api_url}${p}`)}}'
+                             'svc.get("/articles/"+slug)'))
+        self.assertEqual({(e.method, e.url) for e in ex.endpoints if e.is_call}, {("GET", "/articles/{slug}")})
+        self.assertEqual(ex.bases, ["https://conduit.acme.io/api"])
+        self.assertEqual(calls('http.put("https://svc.acme.io/thing/"+id,b)'), {("PUT", "https://svc.acme.io/thing/{id}")})
+
+    def test_a_class_method_called_fetch_is_not_the_fetch_api(self):
+        # ethers' EtherscanProvider: this.fetch("account", {action: "balance"})
+        self.assertEqual(calls('class P{b(t){return this.fetch("account",{action:"balance",address:t})}}'), set())
+        self.assertEqual(calls('class P{b(t){return this.fetch("/api/account/"+t)}}'), {("GET", "/api/account/{param}")})
+
     def test_strings_that_only_look_like_urls(self):
         # URL-parser tests in polyfills, regex fragments, schema paths of a JSON validator
         noise = ('var a="https://a",b="http://f",c="https://a/c%20d",d="/a/b",e="/(.+",'
@@ -242,6 +288,21 @@ class SecretTests(unittest.TestCase):
         # the same value under the same name, without the Algolia siblings, is still a finding
         alone = scan_program(Program('var cfg={apiKey:"%s"}' % hex32), "t.js")
         self.assertEqual([(s.kind, s.public) for s in alone], [("HARDCODED_SECRET", False)])
+
+    def test_passphrase_under_a_password_name(self):
+        # found by JS Miner and missed by DeepJS 0.2.0 in OWASP Juice Shop: a test account's password
+        phrase = "Iam" + "Used" + "For" + "Checking"
+        found = scan_program(Program('class L{testingUsername=`qa@acme.io`;testingPassword=`%s`}' % phrase), "t.js")
+        self.assertEqual([(s.kind, s.severity, s.key) for s in found], [("HARDCODED_PASSWORD", "medium", "testingPassword")])
+        # labels, field names and messages under the same kind of name stay out
+        for value in ("Password", "EnterYourPassword", "passwordComponent", "ForgotPasswordLink", "PleaseConfirmAgain"):
+            self.assertEqual(secret_kinds('var f={password:"%s"}' % value), set(), value)
+
+    def test_parser_tables_and_function_signatures_are_not_secrets(self):
+        # both reported by DeepJS 0.2.0 in OWASP Juice Shop
+        table = "$z~RXOYn" + "!bOX%ZXY+gYZ-yZ[+g[]%Z]^.c^p%Zpq+gqr/mrs3c" + "X~Y~"
+        self.assertEqual(secret_kinds('var parser={repeatNodeCount:37,tokenData:"%s",tokenizers:[0,1]}' % table), set())
+        self.assertEqual(secret_kinds('throwError("x",{name:"OffchainLookup",signature:"OffchainLookup(address,string[],bytes,bytes4,bytes)"})'), set())
 
     def test_supabase_roles(self):
         anon = jwt({"iss": "supabase", "ref": "abc", "role": "anon", "exp": int(time.time()) + 10 ** 8})

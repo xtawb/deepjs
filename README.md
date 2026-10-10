@@ -218,6 +218,56 @@ One real application, for scale: the public OWASP Juice Shop demo (Angular,
 with it, 92 calls, none with an unresolved base. That is one application
 and no ground truth for what was missed — an anecdote, not a benchmark.
 
+### Compared with JS Miner
+
+Seven open-source applications with a public demo, where the real routes are
+known (OWASP Juice Shop's `server.ts`; the RealWorld API specification). Both
+tools were given the same downloaded script files. The score is the number of
+real routes — method and path — a tool identified.
+
+| Application | Real routes | JS Miner 1.16 as shipped | JS Miner, loop fixed¹ | DeepJS, first run | DeepJS 0.2.1 |
+|---|---|---|---|---|---|
+| OWASP Juice Shop (Angular, 3.2 MB) | 140² | 1 | 27 | 82 | 86 |
+| RealWorld — Angular | 19 | 6 | 19 | 15 | 19 |
+| RealWorld — Vue 3, fetch client | 19 | 0 | 0 | 19 | 19 |
+| RealWorld — demo.realworld.show | 19 | 18 | 19 | 17 | 19 |
+| RealWorld — Next.js | 19 | 0 | 1 | 17 | 17 |
+| RealWorld — Nuxt | 19 | 18 | 18 | 0 | 19 |
+| RealWorld — React, axios instance | 19 | 0 | 0 | 6 | 13 |
+| **Total** | **254** | **43** | **84** | **156** | **192** |
+
+"First run" is the honest column: the version that existed before DeepJS had
+seen that application (0.2.0 for the first four rows; 0.2.0 plus the fixes
+from those four for the last three). The 0.2.1 column was measured after
+fixing what each run exposed, on the same applications, so it is a regression
+gate and not an independent result.
+
+What the table shows: JS Miner's `.get(` / `.post(` patterns do well where an
+app calls `client.get("/literal")` directly — it beat DeepJS on two of the
+seven first runs — and find nothing when requests go through `fetch`, a
+request-config object or Babel's `"".concat()`. DeepJS reads all of those but
+had its own blind spots, each now a unit test: conditional path pieces, URLs
+held in a local variable, Nuxt's `$get`, configs without a fixed method.
+
+Secrets, on the one application that had any (Juice Shop): JS Miner reported
+the hard-coded test-account password and three false positives; DeepJS 0.2.0
+missed the password and reported two false positives of its own; 0.2.1 reports
+the password and nothing else.
+
+How it was measured, and what that limits: JS Miner is a Burp extension, so its
+regular expressions were copied verbatim from its source (commit `420c566`)
+and its scanner loops re-run in Python rather than inside Burp. Its output is
+raw source text; it was credited with a route whenever a person could read the
+full path out of the match. Not compared: source-map recovery, dependency
+confusion, subdomain and cloud-URL discovery, which both tools have. Seven
+applications, six of them implementations of one small API, is a small sample.
+
+¹ As written, JS Miner's endpoint loop ends at the first match that has no `/`
+in it, which on a large bundle is usually within the first few matches. The
+second column filters such matches instead.
+² Every route the server defines, including ones no front-end code calls, so
+140 is not reachable from JavaScript alone.
+
 ## Limits
 
 - **Static only.** URLs computed at runtime from server responses, or built by
