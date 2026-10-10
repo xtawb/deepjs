@@ -22,6 +22,7 @@ examples:
   deepjs scan https://app.example.com --sources src/   write the original sources recovered from source maps
   deepjs scan https://app.example.com --check-npm      check bundled package names against the public npm registry
   deepjs diff old/report.json new/report.json          what changed between two scans
+  deepjs update                                        show what the latest release changed and offer to install it
 
 Only scan applications you own or are authorised to test.
 """
@@ -82,6 +83,9 @@ def build_parser() -> argparse.ArgumentParser:
     w = sub.add_parser("serve", help="analysis worker on stdin/stdout — used by the Burp Suite extension")
     w.add_argument("--reveal", action="store_true", help="send full secret values instead of masked ones")
     w.add_argument("--entropy", action="store_true", help="also report unlabelled random-looking strings")
+
+    u = sub.add_parser("update", help="show what the latest release changed and install it (asks first)")
+    u.add_argument("-y", "--yes", action="store_true", help="install without asking")
 
     d = sub.add_parser("diff", help="compare two report.json files")
     d.add_argument("old")
@@ -169,8 +173,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             pass
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("--update", "-update"):
+        argv[0] = "update"                             # the spelling other tools use
     # `deepjs https://…` is shorthand for `deepjs scan https://…`
-    if argv and argv[0] not in ("scan", "diff", "serve", "-h", "--help", "--version"):
+    if argv and argv[0] not in ("scan", "diff", "serve", "update", "-h", "--help", "--version"):
         argv.insert(0, "scan")
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -178,6 +184,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_scan(args)
     if args.command == "diff":
         return cmd_diff(args)
+    if args.command == "update":
+        return update.run_update(assume_yes=args.yes)
     if args.command == "serve":
         from deepjs.serve import serve
         return serve(reveal=args.reveal, entropy=args.entropy)

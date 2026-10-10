@@ -1,11 +1,13 @@
 """Tokenizer, expression evaluation, endpoint extraction, secrets, hosts, source maps, chunk maps."""
 
 import base64
+import io
 import json
 import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from deepjs import chunks, corpus, sourcemap, update
 from deepjs.endpoints import extract
@@ -597,7 +599,7 @@ class UpdateTests(unittest.TestCase):
     def test_notice(self):
         text = update.notice("0.3.0", now=1.0, fetch=self.release("0.4.0"), path=self.cache)
         self.assertIn("deepjs 0.4.0 is available (this is 0.3.0)", text)
-        self.assertIn("pip install --upgrade", text)
+        self.assertIn("deepjs update", text)
         self.assertEqual(update.notice("0.4.0", now=2.0, fetch=self.release("0.4.0"), path=self.cache), "")
         os.environ["DEEPJS_NO_UPDATE_CHECK"] = "1"
         try:
@@ -613,6 +615,103 @@ class UpdateTests(unittest.TestCase):
             fh.write("x")
         path = os.path.join(blocked, "update.json")                # its parent is a file
         self.assertEqual(update.latest_version(now=1.0, fetch=self.release("1.2.3"), path=path), "1.2.3")
+
+    # `deepjs update`: GitHub, the terminal and pip are all replaced; nothing is installed here
+
+    def updating(self, version="9.0.0", notes="", answer=None, status=0, **kwargs):
+        """Returns (exit status, what was printed, the commands that would have run)."""
+        ran, out = [], io.StringIO()
+        self.asked = []
+
+        def fetch():
+            if version is None:
+                raise OSError("offline")
+            return update.Release(version=version, notes=notes)
+
+        def ask(prompt):
+            self.asked.append(prompt)
+            return answer
+
+        def run(command):
+            ran.append(command)
+            return status
+
+        kwargs.setdefault("interactive", answer is not None)
+        kwargs.setdefault("checkout", False)
+        code = update.run_update(out=out, current="0.4.0", fetch=fetch, ask=ask, run=run, **kwargs)
+        return code, out.getvalue(), ran
+
+    def test_update_shows_what_changed_and_asks_first(self):
+        code, text, ran = self.updating(notes="## Fixes\r\n- one\n- two\x1b[2J\x07\n\n", answer="n")
+        self.assertEqual((code, ran), (0, []))
+        self.assertIn("deepjs 9.0.0 is available (this is 0.4.0)", text)
+        self.assertIn("  - one\n  - two[2J\n", text)                  # as written, minus what would drive a terminal
+        self.assertNotIn("\x1b", text)
+        self.assertLess(text.index("/archive/refs/tags/v9.0.0.zip"), text.index("Nothing was changed"))
+        self.assertEqual(len(self.asked), 1)
+
+    def test_update_installs_that_release_when_agreed(self):
+        code, text, ran = self.updating(answer=" Y ")
+        self.assertEqual(code, 0)
+        self.assertEqual(ran, [update.install_command("9.0.0")])
+        self.assertEqual(ran[0][1:5], ["-m", "pip", "install", "--upgrade"])
+        self.assertEqual(ran[0][5], "https://github.com/xtawb/deepjs/archive/refs/tags/v9.0.0.zip")
+        self.assertIn("deepjs is now 9.0.0", text)
+
+    def test_update_without_a_terminal_installs_only_with_yes(self):
+        code, text, ran = self.updating()                           # piped, in CI, from cron
+        self.assertEqual((code, ran, self.asked), (0, [], []))
+        self.assertIn("deepjs update --yes", text)
+        code, text, ran = self.updating(assume_yes=True)
+        self.assertEqual((code, len(ran), self.asked), (0, 1, []))
+
+    def test_update_when_the_question_gets_no_answer(self):
+        def nobody(prompt):
+            raise EOFError
+
+        out = io.StringIO()
+        code = update.run_update(out=out, current="0.4.0", fetch=lambda: update.Release("9.0.0"), ask=nobody,
+                                 run=self.fail, interactive=True, checkout=False)
+        self.assertEqual(code, 0)
+        self.assertIn("deepjs update --yes", out.getvalue())
+
+    def test_update_with_nothing_newer_or_no_network(self):
+        code, text, ran = self.updating(version="0.4.0", answer="y")
+        self.assertEqual((code, ran, self.asked), (0, [], []))
+        self.assertIn("0.4.0 is the latest release", text)
+        code, text, ran = self.updating(version=None, answer="y")
+        self.assertEqual((code, ran), (1, []))
+        self.assertIn("Nothing was changed", text)
+        code, text, ran = self.updating(version="", answer="y")     # a tag that is not a version
+        self.assertEqual((code, ran), (1, []))
+
+    def test_update_leaves_a_source_checkout_to_git(self):
+        code, text, ran = self.updating(answer="y", checkout=True)
+        self.assertEqual((code, ran, self.asked), (0, [], []))
+        self.assertIn("git pull", text)
+
+    def test_update_reports_a_failed_install(self):
+        code, text, ran = self.updating(assume_yes=True, status=3)
+        self.assertEqual(code, 3)
+        self.assertIn("pip exited with status 3", text)
+        self.assertNotIn("is now", text)
+
+    def test_release_notes_are_bounded_and_only_a_version_reaches_pip(self):
+        lines = update.printable("\n".join(f"line {n}" for n in range(500)))
+        self.assertEqual((len(lines), lines[-1]), (update.MAX_NOTES_LINES + 1, "…"))
+        self.assertEqual([len(line) for line in update.printable("y" * 5000)], [300])
+        self.assertEqual(update.install_command("v1.2")[-1], update.RELEASE_ARCHIVE.format(version="1.2"))
+        for hostile in ("", "main", "1.0 --index-url=http://x", "../../x", "1.0/../../y", "1.0\n--pre"):
+            with self.assertRaises(ValueError):
+                update.install_command(hostile)
+
+    def test_update_spellings(self):
+        from deepjs import cli
+        for argv, yes in ((["update"], False), (["--update"], False), (["-update"], False),
+                          (["update", "--yes"], True), (["--update", "-y"], True)):
+            with mock.patch.object(update, "run_update", return_value=0) as run:
+                self.assertEqual(cli.main(argv), 0)
+            run.assert_called_once_with(assume_yes=yes)
 
 
 if __name__ == "__main__":

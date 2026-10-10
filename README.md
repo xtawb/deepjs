@@ -125,6 +125,13 @@ anonymous request to GitHub's API at most once a day (the answer is cached),
 it sends nothing about the scan, and nothing is downloaded or installed.
 `--no-update-check` or `DEEPJS_NO_UPDATE_CHECK=1` turns it off.
 
+`deepjs update` (or `deepjs --update`) does the updating: it prints what the
+latest release changed and the exact `pip` command it is about to run, asks,
+and installs that release's tagged archive. `--yes` skips the question; without
+a terminal and without `--yes` it changes nothing. There is no silent
+self-update — a scanner that replaces its own code unasked is one whose
+results you cannot reproduce. A git checkout is left to `git pull`.
+
 Two things keep it from wasting requests. A single-page app answers every
 route with the same HTML shell, so DeepJS probes three routes and, if they come
 back identical to a page it already has, does not request the rest — the
