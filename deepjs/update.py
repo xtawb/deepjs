@@ -13,6 +13,12 @@ The update. `deepjs update` shows what changed in the latest release and the
 exact command it is about to run, asks, and then lets pip install that
 release. Nothing is ever installed without being asked for: a tool that
 replaces its own code unprompted is a tool whose behaviour you cannot pin.
+
+Where the operating system manages Python (PEP 668: Kali, Debian, Ubuntu…)
+pip refuses to change it unless told to. A copy that pip put there can only
+be replaced the way it was installed — with --break-system-packages — and the
+update says so before it asks. --no-deps goes with it, so that the one thing
+pip touches in the system's Python is deepjs itself.
 """
 
 from __future__ import annotations
@@ -23,9 +29,11 @@ import re
 import shlex
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.request
 from dataclasses import dataclass
+from importlib import metadata
 from typing import Callable, List, Optional, TextIO, Tuple
 
 from deepjs import __version__
@@ -135,13 +143,35 @@ def printable(text: str, max_lines: int = MAX_NOTES_LINES) -> List[str]:
     return lines
 
 
-def install_command(version: str) -> List[str]:
-    """What `deepjs update` runs: pip, for the interpreter that is running deepjs, on that release's archive."""
+def install_command(version: str, into_system: bool = False) -> List[str]:
+    """
+    What `deepjs update` runs: pip, for the interpreter that is running deepjs, on that release's archive.
+    `into_system`: this interpreter is the operating system's (see `externally_managed`).
+    """
     numbers = parse_version(version)
     if not numbers:                         # the tag comes from the network: only digits and dots reach pip
         raise ValueError(f"not a version: {version!r}")
     archive = RELEASE_ARCHIVE.format(version=".".join(map(str, numbers)))
-    return [sys.executable, "-m", "pip", "install", "--upgrade", archive]
+    options = ["--no-deps", "--break-system-packages"] if into_system else []
+    return [sys.executable, "-m", "pip", "install", "--upgrade", *options, archive]
+
+
+def externally_managed() -> bool:
+    """Is this the operating system's own Python (PEP 668), which pip will not change unless told to?"""
+    if sys.prefix != sys.base_prefix:
+        return False                        # a virtual environment — pipx's included — is nobody's but its owner's
+    try:
+        return os.path.isfile(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))
+    except Exception:
+        return False
+
+
+def installed_by() -> str:
+    """What installed this copy — "pip", "debian", … — or "" when it left no record."""
+    try:
+        return (metadata.distribution("deepjs").read_text("INSTALLER") or "").strip().lower()
+    except Exception:
+        return ""
 
 
 def as_typed(command: List[str]) -> str:
@@ -158,7 +188,7 @@ def is_source_checkout() -> bool:
 def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: str = __version__,
                fetch: Callable[[], Release] = fetch_release, ask: Callable[[str], str] = input,
                run: Callable[[List[str]], int] = subprocess.call, interactive: Optional[bool] = None,
-               checkout: Optional[bool] = None) -> int:
+               checkout: Optional[bool] = None, managed: Optional[bool] = None, installer: Optional[str] = None) -> int:
     """
     Look for a newer release, show what changed, and install it if the user agrees.
     Returns a process exit status. The injectable pieces exist for the tests.
@@ -193,7 +223,17 @@ def run_update(assume_yes: bool = False, out: Optional[TextIO] = None, current: 
     if is_source_checkout() if checkout is None else checkout:
         say("This copy runs from a source checkout, so there is nothing for pip to replace: update it with `git pull`.")
         return 0
-    command = install_command(release.version)
+    into_system = externally_managed() if managed is None else managed
+    if into_system:
+        by = installed_by() if installer is None else installer
+        say("This Python belongs to the operating system (PEP 668): pip does not change it unless told to.")
+        if by != "pip":
+            say(f"deepjs was put there by {by or 'something other than pip'}, so it is not pip's to replace. "
+                "Update it the way it was installed.")
+            return 1
+        say("deepjs was installed into it with pip, so replacing it takes the same --break-system-packages. With "
+            "--no-deps, deepjs's own files are all that the command below replaces.")
+    command = install_command(release.version, into_system)
     say("To install it, this will run:")
     say("  " + as_typed(command))
     if not assume_yes:

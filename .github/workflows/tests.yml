@@ -43,6 +43,30 @@ jobs:
       - name: CLI smoke test
         run: deepjs --version
 
+  # Kali, Debian and Ubuntu manage their Python (PEP 668) and pip refuses to change it unless
+  # told to. This runner's own Python is one of those: install a copy as a user there would,
+  # and let it update itself for real.
+  managed-python:
+    name: deepjs update in a system-managed Python
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install an older-labelled copy with the system's pip
+        run: |
+          sed -i 's/^__version__ = .*/__version__ = "0.0.1"/' deepjs/__init__.py
+          /usr/bin/python3 -m pip install --break-system-packages .
+      - name: Update it
+        working-directory: /tmp
+        run: |
+          /usr/bin/python3 - <<'EOF'
+          import sys
+          from deepjs import update
+          assert update.externally_managed(), "this runner's Python was expected to be system-managed"
+          assert update.installed_by() == "pip", update.installed_by()
+          sys.exit(update.run_update(assume_yes=True, fetch=lambda: update.Release("0.4.3")))
+          EOF
+          /usr/bin/python3 -m deepjs --version | tee /dev/stderr | grep -qx "deepjs 0.4.3"
+
   parity:
     name: Parity with the Burp extension's engine
     runs-on: ubuntu-latest

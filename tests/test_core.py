@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -674,6 +675,7 @@ class UpdateTests(unittest.TestCase):
 
         kwargs.setdefault("interactive", answer is not None)
         kwargs.setdefault("checkout", False)
+        kwargs.setdefault("managed", False)
         code = update.run_update(out=out, current="0.4.0", fetch=fetch, ask=ask, run=run, **kwargs)
         return code, out.getvalue(), ran
 
@@ -725,6 +727,34 @@ class UpdateTests(unittest.TestCase):
         code, text, ran = self.updating(answer="y", checkout=True)
         self.assertEqual((code, ran, self.asked), (0, [], []))
         self.assertIn("git pull", text)
+
+    def test_update_into_a_python_the_system_manages(self):
+        # Kali, Debian, Ubuntu: pip refuses ("externally-managed-environment") unless it is told to go ahead
+        code, text, ran = self.updating(answer="y", managed=True, installer="pip")
+        self.assertEqual(code, 0)
+        self.assertEqual(ran, [update.install_command("9.0.0", into_system=True)])
+        self.assertEqual(ran[0][3:7], ["install", "--upgrade", "--no-deps", "--break-system-packages"])
+        self.assertLess(text.index("PEP 668"), text.index("--break-system-packages"))       # said before it is asked
+        self.assertLess(text.index("this will run"), text.index("deepjs is now 9.0.0"))
+        code, text, ran = self.updating(answer="n", managed=True, installer="pip")
+        self.assertEqual((code, ran), (0, []))
+
+    def test_update_leaves_a_system_package_to_the_system(self):
+        for installer in ("debian", ""):                            # apt put it there, or nobody can tell who did
+            code, text, ran = self.updating(answer="y", managed=True, installer=installer)
+            self.assertEqual((code, ran, self.asked), (1, [], []))
+            self.assertIn("the way it was installed", text)
+
+    def test_a_virtual_environment_is_not_the_systems_python(self):
+        marker = os.path.join(self.tmp.name, "EXTERNALLY-MANAGED")
+        with mock.patch.object(update.sysconfig, "get_path", return_value=self.tmp.name):
+            with mock.patch.object(sys, "prefix", sys.base_prefix):
+                self.assertFalse(update.externally_managed())
+                open(marker, "w").close()
+                self.assertTrue(update.externally_managed())
+            with mock.patch.object(sys, "prefix", os.path.join(self.tmp.name, "venv")):
+                self.assertFalse(update.externally_managed())               # pipx, python -m venv
+        self.assertIn(update.installed_by(), ("", "pip"))                   # a checkout, or installed for the tests
 
     def test_update_reports_a_failed_install(self):
         code, text, ran = self.updating(assume_yes=True, status=3)

@@ -76,6 +76,12 @@ pip install git+https://github.com/xtawb/deepjs
 
 or from a checkout: `pip install .`
 
+On Kali, Debian and Ubuntu the system's Python is managed by the operating
+system and `pip` answers `externally-managed-environment`. Use
+`pipx install git+https://github.com/xtawb/deepjs`, which gives deepjs an
+environment of its own, or add `--break-system-packages` to the `pip` command:
+deepjs has no dependencies, so it is the only thing that lands there.
+
 ## Use
 
 ```bash
@@ -130,7 +136,11 @@ latest release changed and the exact `pip` command it is about to run, asks,
 and installs that release's tagged archive. `--yes` skips the question; without
 a terminal and without `--yes` it changes nothing. There is no silent
 self-update — a scanner that replaces its own code unasked is one whose
-results you cannot reproduce. A git checkout is left to `git pull`. On Windows
+results you cannot reproduce. A git checkout is left to `git pull`. In a
+system-managed Python (Kali, Debian, Ubuntu) where pip installed deepjs, the
+update says so and runs pip with `--no-deps --break-system-packages`, so that
+deepjs's own files are all it replaces; a copy the system's package manager
+installed is left to it. On Windows
 pip may end with a warning that it could not remove a temporary directory:
 that is the `deepjs.exe` still running the command, and the update is done.
 
