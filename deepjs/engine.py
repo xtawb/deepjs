@@ -605,7 +605,7 @@ class Engine:
         if ep.confidence > old.confidence:
             old.confidence, old.kind = ep.confidence, ep.kind
         if ep.file.startswith("map:") and not old.file.startswith("map:"):
-            old.file, old.line = ep.file, ep.line         # the original source is the better pointer
+            old.file, old.line, old.excerpt = ep.file, ep.line, ep.excerpt    # the original source is the better pointer
 
     def resolve_bases(self) -> None:
         """

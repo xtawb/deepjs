@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 from deepjs.entropy import classify, is_placeholder
 from deepjs.jseval import Program, is_static, render
-from deepjs.lexer import ID, K, PUNC, STR, TPL, V
+from deepjs.lexer import ID, K, NO_EXCERPT, PUNC, STR, TPL, V, Excerpt
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 MAX_SCANNED = 8192                  # longer strings are data, not credentials
@@ -45,6 +45,7 @@ class Secret:
     line:       int = 0
     note:       str = ""
     public:     bool = False        # public by design (not a leak)
+    excerpt:    Excerpt = NO_EXCERPT    # the code around the value: as raw as `value`, and never in a report
 
     @property
     def masked(self) -> str:
@@ -314,10 +315,13 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
     seen: set = set()
     in_page = "#inline-" in file
 
-    def add(s: Secret) -> None:
+    def add(s: Secret, start: int, end: int) -> None:
+        """Record `s`, read from the source between `start` and `end`."""
         k = (s.kind, s.value)
         if k not in seen:
             seen.add(k)
+            at = p.lex.src.find(s.value, start, end)        # the value itself, where it is written out
+            s.excerpt = p.lex.excerpt(at, at + len(s.value)) if at >= 0 else p.lex.excerpt(start, end)
             out.append(s)
 
     for i, tok in enumerate(p.tokens):
@@ -333,6 +337,7 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
             continue
         key = _key_context(p, i)
         line = 0
+        where = (tok[2], tok[3])                            # the literal's place in the source
 
         typed = _typed_matches(text)
         for tk, value, sev, pub, note in typed:
@@ -343,7 +348,7 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
             if tk == "TWILIO_API_KEY" and "twilio" not in p.lex.src[max(0, tok[2] - 300):tok[3] + 300].lower():
                 continue
             line = line or p.line(i)
-            add(Secret(tk, sev, 0.95 if not pub else 0.9, value, key, file, line, note, pub))
+            add(Secret(tk, sev, 0.95 if not pub else 0.9, value, key, file, line, note, pub), *where)
         if typed:
             continue
 
@@ -365,7 +370,7 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
         if label == "benign" and strength == 2 and _PASSWORD_KEY.search(normalise_key(key)) and _passphrase_like(value):
             # testingPassword = "IamUsedForTesting": words, but written like a password, under a password's name
             add(Secret("HARDCODED_PASSWORD", "medium", 0.5, value, key, file, p.line(i),
-                       f"Passphrase-like value assigned to '{key[:60]}' — often a default or test account's password."))
+                       f"Passphrase-like value assigned to '{key[:60]}' — often a default or test account's password."), *where)
             continue
         if label in ("placeholder", "benign"):
             continue
@@ -373,28 +378,28 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
             # {appId, apiKey, indexName}: what every site with Algolia search ships to the browser
             add(Secret("ALGOLIA_SEARCH_KEY", "info", 0.8, value, key, file, p.line(i),
                        "Algolia key next to appId / indexName — a search-only key is public by design. An admin key "
-                       "has the same shape: check its ACL in the Algolia dashboard.", True))
+                       "has the same shape: check its ACL in the Algolia dashboard.", True), *where)
             continue
         if strength == 2:
             if label == "weak" and not re.search(r"[\d!@#$%^&*+=/\\|~?]", value):
                 continue
             if visitor:
-                add(_page_token(value, key, file, p.line(i)))
+                add(_page_token(value, key, file, p.line(i)), *where)
                 continue
             conf = 0.45 + 0.4 * score
             sev = "high" if conf >= 0.72 else "medium"
             add(Secret("HARDCODED_SECRET", sev, min(conf, 0.92), value, key, file, p.line(i),
-                       f"Literal value assigned to '{key[:60]}'."))
+                       f"Literal value assigned to '{key[:60]}'."), *where)
         elif strength == 1:
             if label == "secret" and visitor:
-                add(_page_token(value, key, file, p.line(i)))
+                add(_page_token(value, key, file, p.line(i)), *where)
             elif label == "secret":
                 add(Secret("HARDCODED_SECRET", "medium", 0.4 + 0.4 * score, value, key, file, p.line(i),
-                           f"Random-looking value assigned to '{key[:60]}'."))
+                           f"Random-looking value assigned to '{key[:60]}'."), *where)
         elif entropy and label == "secret" and 32 <= len(value) <= 128 and strength == 0 \
                 and not re.fullmatch(r"[0-9a-fA-F]+", value) and not key.isdigit():
             add(Secret("HIGH_ENTROPY_STRING", "low", 0.3 + 0.3 * score, value, key, file, p.line(i),
-                       "Unlabelled random-looking string (enabled by --entropy; expect noise)."))
+                       "Unlabelled random-looking string (enabled by --entropy; expect noise)."), *where)
 
     # comments survive in recovered sources and un-minified files
     for pos, text in p.lex.comments:
@@ -402,9 +407,12 @@ def scan_program(p: Program, file: str = "", entropy: bool = False) -> List[Secr
             continue
         line = p.lex.line_of(pos)
         # line by line, each bounded: a licence banner of megabytes costs what its lines cost
+        following = pos
         for n, row in enumerate(text.split("\n")):
+            row_at, following = following, following + len(row) + 1
             if len(row) < 12:
                 continue
             for tk, value, sev, pub, note in _typed_matches(row[:MAX_SCANNED]):
-                add(Secret(tk, sev, 0.85, value, "(comment)", file, line + n, note, pub))
+                add(Secret(tk, sev, 0.85, value, "(comment)", file, line + n, note, pub),
+                    row_at, row_at + min(len(row), MAX_SCANNED))
     return out

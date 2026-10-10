@@ -266,6 +266,42 @@ class EndpointTests(unittest.TestCase):
         self.assertLess(len(ours["false_positives"]), len(base["false_positives"]))
 
 
+class ExcerptTests(unittest.TestCase):
+    """A finding is a claim about some code, and it carries that code: what stands before it, the span, what follows."""
+
+    def test_an_endpoint_carries_the_code_it_was_read_from(self):
+        code = "function load(id){ return fetch(`/api/v1/users/${id}/roles`, {method: 'POST'}) }"
+        (ep,) = extract(Program(code)).endpoints
+        self.assertEqual(ep.excerpt[1], "fetch")
+        self.assertEqual("".join(ep.excerpt), code)
+        self.assertNotIn("excerpt", ep.to_dict())                           # raw source is not for a report
+
+    def test_an_excerpt_is_bounded(self):
+        bundle = "a;" * 400 + 'axios.get("/api/v1/orders");' + "b;" * 400  # a minified bundle is one long line
+        before, span, after = next(e for e in extract(Program(bundle)).endpoints if e.url == "/api/v1/orders").excerpt
+        self.assertEqual((len(before), span, len(after)), (160, "get", 240))
+        self.assertIn(before + span + after, bundle)
+        literal = "'/api/v1/" + "x" * 900 + "'"
+        before, span, after = extract(Program("var u = " + literal + ";")).endpoints[0].excerpt
+        self.assertEqual((before, len(span), after), ("var u = ", 240, literal[240:480]))
+
+    def test_a_secret_carries_the_code_around_its_value(self):
+        value = "AKIA" + "Q7ZP2MXL4RT9VB6N"
+        other = value[:-1] + "9"
+        code = f'const cfg = {{ region: "eu", key: "{value}" }};\n/* deploy with\n   {other} */'
+        literal, comment = scan_program(Program(code), "t.js")
+        self.assertEqual(literal.excerpt, ('const cfg = { region: "eu", key: "', value, '" };\n/* deploy with\n   ' + other + " */"))
+        self.assertEqual((comment.key, comment.excerpt[1], comment.excerpt[2]), ("(comment)", other, " */"))
+        self.assertTrue(comment.excerpt[0].endswith("/* deploy with\n   "))
+        self.assertNotIn("excerpt", literal.to_dict(reveal=True))
+
+    def test_a_value_that_is_not_written_out_is_shown_by_its_literal(self):
+        code = 'const c = {clientSecret: "Zx9Qm2Lk\\x38Pz4Rt6Vw1Yb5Nc7Hf0Jg3Ua"};'       # \x38 is "8"
+        (found,) = scan_program(Program(code), "t.js")
+        self.assertEqual(found.value, "Zx9Qm2Lk8Pz4Rt6Vw1Yb5Nc7Hf0Jg3Ua")
+        self.assertEqual(found.excerpt[1], '"Zx9Qm2Lk\\x38Pz4Rt6Vw1Yb5Nc7Hf0Jg3Ua"')
+
+
 class SecretTests(unittest.TestCase):
     def test_typed_tokens(self):
         cases = {

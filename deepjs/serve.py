@@ -17,9 +17,9 @@ and `\\\\` are escaped inside fields):
 
   worker → host
       READY deepjs <version>
-      E <method> <full url> <url> <kind> <query,…> <body,…> <headers,…> <file> <line> <confidence>
+      E <method> <full url> <url> <kind> <query,…> <body,…> <headers,…> <file> <line> <confidence> <code…>
       W <method> <url>                       withdraw that endpoint: a better one replaces it
-      S <severity> <kind> <shown value> <key> <file> <line> <note> <fingerprint> <public 0|1>
+      S <severity> <kind> <shown value> <key> <file> <line> <note> <fingerprint> <public 0|1> <code…>
       C <script url>                         referenced by the code, not seen yet (a hidden chunk)
       M <map url> <referenced 0|1>           a source map worth fetching
       H <host> <class> <service> <nonprod 0|1>
@@ -30,6 +30,11 @@ and `\\\\` are escaped inside fields):
 
 Only findings that are new (or whose details grew) since the previous message
 are written, so the host can simply append.
+
+`<code…>` is three fields — the source before the finding, the finding itself,
+the source after it — so that a host can show a finding in its code. They are
+empty unless the worker was started with --reveal: the code around a finding
+can hold exactly what masking hides.
 """
 
 from __future__ import annotations
@@ -133,6 +138,9 @@ class Worker:
         guess = bases[0].rstrip("/") if len(bases) == 1 else self._origin_of(ep)
         return guess + u[end:] if guess else u
 
+    def _code(self, excerpt: Tuple[str, str, str]) -> Tuple[str, str, str]:
+        return excerpt if self.reveal else ("", "", "")
+
     def flush_new(self) -> None:
         eng = self.engine
         eng.resolve_bases()
@@ -146,12 +154,12 @@ class Worker:
             if self._endpoints.get(key) != sig:
                 self._endpoints[key] = sig
                 self.send("E", ep.method, self._full_url(ep), ep.url, ep.kind, ",".join(ep.params), ",".join(ep.body),
-                          ",".join(ep.headers), ep.file, ep.line, f"{ep.confidence:.2f}")
+                          ",".join(ep.headers), ep.file, ep.line, f"{ep.confidence:.2f}", *self._code(ep.excerpt))
         for key, s in list(eng._secrets.items()):
             if key not in self._secrets:
                 self._secrets.add(key)
                 self.send("S", s.severity, s.kind, s.value if self.reveal else s.masked, s.key, s.file, s.line,
-                          s.note, s.fingerprint, 1 if s.public else 0)
+                          s.note, s.fingerprint, 1 if s.public else 0, *self._code(s.excerpt))
 
         def once(tag: str, ident: str, *fields: object) -> None:
             if ident not in self._sent[tag]:

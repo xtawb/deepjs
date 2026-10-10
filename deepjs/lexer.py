@@ -28,6 +28,11 @@ STR, TPL, ID, NUM, PUNC, REGEX = "str", "tpl", "id", "num", "punc", "regex"
 K, V, S, E = 0, 1, 2, 3
 Token = Tuple[str, object, int, int]
 
+# The code a finding was read from: what stands before the span, the span, what follows.
+Excerpt = Tuple[str, str, str]
+NO_EXCERPT: Excerpt = ("", "", "")
+EXCERPT_BEFORE, EXCERPT_SPAN, EXCERPT_AFTER = 160, 240, 240
+
 _MASTER = re.compile(
     r"""
      (?P<ws>[ \t\r\n\u00a0\ufeff\u2028\u2029]+)
@@ -201,6 +206,18 @@ class Lexed:
 
     def token_line(self, index: int) -> int:
         return self.line_of(self.tokens[index][S]) if 0 <= index < len(self.tokens) else 0
+
+    def excerpt(self, start: int, end: int) -> Excerpt:
+        """The source around [start, end), so that a finding can be shown in its code."""
+        src = self.src
+        start = max(0, min(start, len(src)))
+        end = max(start, min(end, start + EXCERPT_SPAN, len(src)))
+        return src[max(0, start - EXCERPT_BEFORE):start], src[start:end], src[end:end + EXCERPT_AFTER]
+
+    def token_excerpt(self, index: int) -> Excerpt:
+        if not 0 <= index < len(self.tokens):
+            return NO_EXCERPT
+        return self.excerpt(self.tokens[index][S], self.tokens[index][E])
 
     # ── tokenizing ────────────────────────────────────────────────────────────
 

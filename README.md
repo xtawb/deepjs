@@ -312,6 +312,12 @@ targets ─► collect scripts ─► tokenize ─► endpoints · secrets · ho
 | `engine.py` · `report.py` · `cli.py` | crawling and orchestration, output, command line |
 | `serve.py` | stdin/stdout analysis worker for other tools |
 
+Each endpoint and secret also carries the code it was read from — what stands
+before the finding, the finding, what follows — so that a tool showing a
+finding can show it in its code. That source travels over `deepjs serve
+--reveal` only: it can hold exactly what masking hides, so it is in neither
+the reports nor an unrevealed `serve`.
+
 ### Two engines, one set of rules
 
 The command line is Python; a Burp extension that needs a Python interpreter

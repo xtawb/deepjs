@@ -293,6 +293,17 @@ class EndToEnd(unittest.TestCase):
         self.assertIn(["M", base + "/static/js/main.a1b2.js.map", "1"], lines)
         secret = next(ln for ln in lines if ln[0] == "S" and ln[2] == "HARDCODED_SECRET")
         self.assertNotIn(CLIENT_SECRET, "\t".join(secret))                    # masked unless --reveal
+        self.assertEqual((login[11:], secret[10:]), (["", "", ""], ["", "", ""]))    # and no source: it can hold the value
+
+        revealed = io.StringIO()
+        Worker(revealed, reveal=True).handle(
+            "\t".join(["A", "1", "script", base + "/static/js/main.a1b2.js", b64.b64encode(MAIN.encode()).decode()]) + "\n")
+        records = [[unesc(field) for field in ln.split("\t")] for ln in revealed.getvalue().split("\n")[:-1]]
+        shown = next(r for r in records if r[0] == "E" and r[3] == "/api/v1/auth/login")
+        self.assertTrue(shown[12] and "".join(shown[11:14]) in MAIN)             # the call, in its code
+        shown = next(r for r in records if r[0] == "S" and r[2] == "HARDCODED_SECRET")
+        self.assertEqual((shown[3], shown[11]), (CLIENT_SECRET, CLIENT_SECRET))
+        self.assertIn("".join(shown[10:13]), MAIN)
 
         lines = feed("4", "map", base + "/static/js/main.a1b2.js.map", json.dumps(MAIN_MAP))
         self.assertTrue(any(ln[0] == "S" and ln[2] == "GITHUB_TOKEN" for ln in lines))

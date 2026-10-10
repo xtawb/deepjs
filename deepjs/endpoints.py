@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from deepjs.jseval import ALT, Part, Program, expand, is_static, render
-from deepjs.lexer import ID, K, PUNC, STR, TPL, V
+from deepjs.lexer import ID, K, NO_EXCERPT, PUNC, STR, TPL, V, Excerpt
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 _METHOD_CALLS = {"get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH", "delete": "DELETE",
@@ -75,6 +75,7 @@ class Endpoint:
     file:       str = ""
     line:       int = 0
     confidence: float = 0.5
+    excerpt:    Excerpt = NO_EXCERPT    # the code at file:line — raw source, so not part of a report
 
     @property
     def is_call(self) -> bool:
@@ -274,6 +275,7 @@ class _Extractor:
         elif old is None and any(k[1] == ep.url for k in self._by_key):
             return True                             # already known as a call
         if old is None:
+            ep.excerpt = self.p.lex.token_excerpt(tok)
             self._by_key[ep.key()] = ep
             self.out.endpoints.append(ep)
         else:                                       # same request seen again: merge what we learned
