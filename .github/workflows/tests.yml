@@ -43,11 +43,17 @@ jobs:
       - name: CLI smoke test
         run: deepjs --version
 
-  burp-extension:
-    name: Burp extension (build + harness)
+  parity:
+    name: Parity with the Burp extension's engine
     runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: xtawb/deepjs-burp
+          path: deepjs-burp
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -55,18 +61,10 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      # Compiles against the oldest supported Montoya API, runs the harness (the extension
-      # against a mocked Burp API, hostile input included) and the parity check: the Java
-      # engine must report exactly what the Python engine reports.
-      - name: Build and test
-        run: python burp/build.py --test
-      # The build PortSwigger's BApp Store uses. Its jar must hold the same engine.
-      - name: Build with Gradle
-        run: gradle --no-daemon jar
-      - name: The Gradle jar agrees with the Python engine too
-        run: python burp/parity.py --classpath build/libs/deepjs-burp.jar
-      - uses: actions/upload-artifact@v4
-        with:
-          name: deepjs-burp
-          path: burp/build/deepjs-burp.jar
-          if-no-files-found: error
+      # The extension carries a Java port of this engine. Build it and require that it
+      # reports exactly what this engine reports: a rule changed here must be changed there.
+      - name: Build the extension
+        working-directory: deepjs-burp
+        run: ./gradlew --no-daemon jar
+      - name: Compare the two engines
+        run: python deepjs-burp/tools/parity.py --classpath deepjs-burp/build/libs/deepjs-burp.jar --engine .
