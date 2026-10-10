@@ -1,0 +1,49 @@
+// Builds the Burp Suite extension:  gradle jar  →  build/libs/deepjs-burp.jar
+//
+// The jar holds the extension (burp/src) and, under engine/, the analysis engine
+// (the `deepjs` Python package of this repository). `python burp/build.py --test`
+// builds the same jar with nothing but a JDK and runs the test harness against it.
+
+plugins {
+    id 'java'
+}
+
+group = 'io.github.xtawb'
+version = '0.3.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // provided by Burp at run time; the oldest API the code is written against
+    compileOnly 'net.portswigger.burp.extensions:montoya-api:2023.12.1'
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['burp/src']
+        }
+        resources {
+            srcDirs = []
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+processResources {
+    from('deepjs') {
+        include '*.py'
+        into 'engine/deepjs'
+    }
+}
+
+jar {
+    archiveBaseName = 'deepjs-burp'
+    archiveVersion = ''
+}

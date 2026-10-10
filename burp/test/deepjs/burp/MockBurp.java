@@ -44,10 +44,13 @@ final class MockBurp {
     final List<HttpRequestResponse> history = new ArrayList<>();
     volatile Component suiteTab;
     volatile ExtensionUnloadingHandler unloadHandler;
-    private final String command;
+    private final String python;
+    private final String jar;
 
-    MockBurp(String workerCommand) {
-        this.command = workerCommand;
+    /** @param python the saved "Python" setting; @param jar what Burp reports as the extension's file */
+    MockBurp(String python, String jar) {
+        this.python = python;
+        this.jar = jar;
         ObjectFactoryLocator.FACTORY = mock(MontoyaObjectFactory.class, Map.of(
                 "httpRequestFromUrl", a -> request((String) a[0], "GET", new ArrayList<>())
         ));
@@ -130,6 +133,7 @@ final class MockBurp {
         return mock(HttpResponse.class, Map.of(
                 "statusCode", a -> (short) status,
                 "body", a -> array,
+                "bodyToString", a -> body,
                 "statedMimeType", a -> mime,
                 "inferredMimeType", a -> mime
         ));
@@ -161,7 +165,9 @@ final class MockBurp {
         Object http = mock(burp.api.montoya.http.Http.class, Map.of(
                 "sendRequest", a -> {
                     String url = ((HttpRequest) a[0]).url();
-                    requested.add(url);
+                    if (!url.startsWith("https://api.github.com/")) {
+                        requested.add(url);                 // the update check is not a request to the target
+                    }
                     String body = site.get(url);
                     HttpResponse resp = body == null ? response(404, "not found", MimeType.PLAIN_TEXT)
                             : response(200, body, url.endsWith(".map") ? MimeType.JSON : MimeType.SCRIPT);
@@ -169,7 +175,7 @@ final class MockBurp {
                 }
         ));
         Object prefs = mock(burp.api.montoya.persistence.Preferences.class, Map.of(
-                "getString", a -> "deepjs.command".equals(a[0]) ? command : null,
+                "getString", a -> "deepjs.python".equals(a[0]) ? python : null,
                 "getBoolean", a -> null
         ));
         Object persistence = mock(burp.api.montoya.persistence.Persistence.class, Map.of("preferences", a -> prefs));
@@ -177,6 +183,7 @@ final class MockBurp {
                 "registerSuiteTab", a -> { suiteTab = (Component) a[1]; return mock(burp.api.montoya.core.Registration.class, Map.of()); }
         ));
         Object extension = mock(burp.api.montoya.extension.Extension.class, Map.of(
+                "filename", a -> jar,
                 "registerUnloadingHandler", a -> { unloadHandler = (ExtensionUnloadingHandler) a[0]; return mock(burp.api.montoya.core.Registration.class, Map.of()); }
         ));
         Object logging = mock(burp.api.montoya.logging.Logging.class, Map.of(

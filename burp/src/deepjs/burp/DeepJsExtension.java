@@ -20,6 +20,7 @@ import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import java.awt.Component;
+import java.io.File;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -33,6 +34,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.swing.JMenuItem;
 import javax.swing.Timer;
 
@@ -40,20 +43,25 @@ import javax.swing.Timer;
  * DeepJS for Burp Suite.
  *
  * Every JavaScript / HTML response that passes through Burp is handed to the
- * DeepJS engine (a local `deepjs serve` process). What it finds appears in the
- * "DeepJS" tab: API calls with method, parameters and body fields; secrets;
- * hosts; and the scripts and source maps the code names but no page has
- * loaded — which the extension can then request through Burp, so they land in
- * the site map and are analysed too.
+ * DeepJS engine. What it finds appears in the "DeepJS" tab: API calls with
+ * method, parameters and body fields; secrets; hosts; and the scripts and
+ * source maps the code names but no page has loaded — which the extension can
+ * then request through Burp, so they land in the site map and are analysed too.
+ *
+ * The engine is Python and travels inside this jar (`engine/deepjs`); it runs
+ * in a local process started with whatever Python 3 the machine has. The
+ * engine never touches the network: every request is made here, through Burp.
  */
 public final class DeepJsExtension implements BurpExtension, HttpHandler, ContextMenuItemsProvider,
         DeepJsTab.Actions, Worker.Listener {
 
+    static final String VERSION = "0.3.0";
     private static final int MAX_BODY = 20 * 1024 * 1024;
     private static final int MAX_FETCHES = 400;                 // per "Clear" — a ceiling on extension-made requests
-    private static final String DEFAULT_COMMAND =
-            System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win")
-                    ? "python -m deepjs serve" : "python3 -m deepjs serve";
+    private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    static final String RELEASES_API = "https://api.github.com/repos/xtawb/deepjs/releases/latest";
+    private static final String RELEASES_PAGE = "https://github.com/xtawb/deepjs/releases/latest";
+    private static final Pattern TAG_NAME = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9]+(?:\\.[0-9]+)*)\"");
 
     private MontoyaApi api;
     private Preferences prefs;
@@ -71,6 +79,10 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
     private final AtomicInteger analysedCount = new AtomicInteger();
     private volatile boolean healthy;
     private volatile String state = "starting…";
+    private volatile String notice = "";              // shown after the state: "update available: 0.4.0"
+    private volatile String explained = "";           // the failure the log last explained
+    private volatile boolean missedWhileDown;         // responses passed while the engine was not running
+    private String enginePath = "";
 
     // ── BurpExtension ────────────────────────────────────────────────────────
 
@@ -87,7 +99,10 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
             t.setDaemon(true);
             return t;
         });
-        worker = new Worker(Worker.splitCommand(tab.command.getText()), this);
+        enginePath = bundledEngine();
+        worker = new Worker(List.of(), this);
+        worker.setEnginePath(enginePath);
+        worker.setCommands(engineCommands(tab.command.getText()));
 
         api.userInterface().registerSuiteTab("DeepJS", tab);
         api.userInterface().registerContextMenuItemsProvider(this);
@@ -96,8 +111,68 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
 
         statusTimer = new Timer(1000, e -> refreshStatus());
         statusTimer.start();
-        new Thread(() -> worker.start(), "deepjs-start").start();
-        api.logging().logToOutput("DeepJS loaded. Engine command: " + tab.command.getText());
+        background("deepjs-start", worker::start);
+        if (tab.updateCheck.isSelected()) {
+            background("deepjs-update", this::checkForUpdate);
+        }
+        api.logging().logToOutput("DeepJS " + VERSION + " loaded"
+                + (enginePath.isEmpty() ? " (no bundled engine: using the installed deepjs package)." : "."));
+    }
+
+    /** Run `body` on a daemon thread; whatever it throws goes to the extension's error stream. */
+    private void background(String name, Runnable body) {
+        Thread t = new Thread(() -> {
+            try {
+                body.run();
+            } catch (RuntimeException e) {
+                api.logging().logToError("DeepJS (" + name + "): " + e);
+            }
+        }, name);
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** `<this jar>/engine`: where the jar carries the engine. Empty when it does not (a development build). */
+    private String bundledEngine() {
+        try {
+            if (DeepJsExtension.class.getResource("/engine/deepjs/__init__.py") == null) {
+                return "";
+            }
+            String jar = api.extension().filename();
+            return jar == null || jar.isBlank() || !new File(jar).isFile() ? "" : jar + File.separator + "engine";
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
+    /**
+     * The command lines to try for the engine. With nothing configured: the
+     * usual names of a Python 3 interpreter on this platform, in order.
+     */
+    static List<List<String>> engineCommands(String configured) {
+        List<String> interpreter = Worker.splitCommand(configured == null ? "" : configured);
+        int module = interpreter.indexOf("-m");
+        if (module > 0) {
+            interpreter = interpreter.subList(0, module);       // a whole command line was pasted: keep the interpreter
+        }
+        List<List<String>> interpreters = new ArrayList<>();
+        if (!interpreter.isEmpty()) {
+            interpreters.add(interpreter);
+        } else if (WINDOWS) {
+            interpreters.add(List.of("python"));
+            interpreters.add(List.of("py", "-3"));
+            interpreters.add(List.of("python3"));
+        } else {
+            interpreters.add(List.of("python3"));
+            interpreters.add(List.of("python"));
+        }
+        List<List<String>> commands = new ArrayList<>();
+        for (List<String> candidate : interpreters) {
+            List<String> command = new ArrayList<>(candidate);
+            command.addAll(List.of("-m", "deepjs", "serve"));
+            commands.add(command);
+        }
+        return commands;
     }
 
     private void unload() {
@@ -111,8 +186,8 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
     // ── settings ─────────────────────────────────────────────────────────────
 
     private void loadSettings() {
-        String cmd = prefs.getString("deepjs.command");
-        tab.command.setText(cmd == null || cmd.isBlank() ? DEFAULT_COMMAND : cmd);
+        String python = prefs.getString("deepjs.python");
+        tab.command.setText(python == null ? "" : python);
         tab.forEachOption(box -> {
             Boolean v = prefs.getBoolean("deepjs." + box.getText());
             if (v != null) {
@@ -130,10 +205,11 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
     }
 
     @Override
-    public void restartWorker(String commandLine) {
-        prefs.setString("deepjs.command", commandLine.trim());
-        worker.setCommand(Worker.splitCommand(commandLine));
-        new Thread(() -> worker.start(), "deepjs-restart").start();
+    public void restartWorker(String python) {
+        prefs.setString("deepjs.python", python.trim());
+        worker.setCommands(engineCommands(python));
+        explained = "";
+        background("deepjs-restart", worker::start);
     }
 
     // ── passive analysis ─────────────────────────────────────────────────────
@@ -197,19 +273,23 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
 
     private boolean analyse(String kind, String url, byte[] body) {
         String clean = url.split("#", 2)[0];
-        if (!analysed.add(clean + "|" + body.length + "|" + Arrays.hashCode(body))) {
+        String fingerprint = clean + "|" + body.length + "|" + Arrays.hashCode(body);
+        if (!analysed.add(fingerprint)) {
             return false;                                   // this exact response was analysed already
         }
         if (analysed.size() > 100_000) {
             analysed.clear();
+        }
+        if (!worker.submit(kind, clean, body)) {
+            analysed.remove(fingerprint);                   // the engine is down: let it be queued again later
+            missedWhileDown = true;
+            return false;
         }
         String host = hostOf(clean);
         if (!host.isEmpty()) {
             analysedHosts.add(host);
         }
         fetched.add(clean);
-        analysedCount.incrementAndGet();
-        worker.submit(kind, clean, body);
         return true;
     }
 
@@ -267,6 +347,7 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
             case "B" -> tab.putOther("API base URLs", f[1]);
             case "P" -> tab.putOther("npm packages (from source maps)", f[1]);
             case "X" -> tab.log("engine: " + (f.length > 1 ? f[1] : ""));
+            case "D" -> analysedCount.incrementAndGet();
             default -> { }
         }
     }
@@ -277,12 +358,77 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
         state = text;
         tab.log(text);
         if (!ok) {
-            tab.log("  The engine is the DeepJS Python package, version 0.2.0 or newer:");
-            tab.log("      pip install --upgrade git+https://github.com/xtawb/deepjs");
-            tab.log("  Check it with:  python -m deepjs --version");
-            tab.log("  Then set the worker command above (the full path to python, if it is not on PATH) and press Apply / restart.");
+            // whatever was queued is lost with the process: forget it was seen, so it can be analysed later
+            analysed.clear();
+            missedWhileDown = true;
+            if (!text.equals(explained)) {
+                explained = text;
+                explain(text);
+            }
+        } else {
+            explained = "";
+            if (missedWhileDown) {
+                missedWhileDown = false;
+                if (tab.enabled.isSelected()) {
+                    tab.log("the engine was not running earlier: analysing what is already in the proxy history");
+                    analyseProxyHistory();
+                }
+            }
         }
         refreshStatus();
+    }
+
+    private void explain(String failure) {
+        boolean bundled = !enginePath.isEmpty();
+        if (!bundled || failure.contains("No module named")) {
+            tab.log("  This Python has no DeepJS engine. Install it with:");
+            tab.log("      python -m pip install --upgrade git+https://github.com/xtawb/deepjs");
+        }
+        tab.log("  DeepJS runs its analysis engine with Python 3.11 or newer"
+                + (bundled ? "; the engine itself is inside this extension, so there is nothing to install with pip." : "."));
+        tab.log("  If Python is installed but was not found, enter its full path under \"Python\" above and press Apply / restart, e.g.");
+        tab.log("      " + (WINDOWS ? "C:\\Users\\you\\AppData\\Local\\Programs\\Python\\Python313\\python.exe" : "/usr/bin/python3"));
+    }
+
+    // ── update notice ────────────────────────────────────────────────────────
+
+    /** One request to GitHub's API, through Burp, when the extension loads. Silent when offline. */
+    private void checkForUpdate() {
+        HttpRequest request = HttpRequest.httpRequestFromUrl(RELEASES_API)
+                .withAddedHeader("Accept", "application/vnd.github+json")
+                .withAddedHeader("User-Agent", "DeepJS-Burp/" + VERSION);
+        HttpResponse response = api.http().sendRequest(request).response();
+        if (response == null || response.statusCode() != 200) {
+            return;
+        }
+        String latest = latestTag(response.bodyToString());
+        if (isNewer(latest, VERSION)) {
+            notice = "update available: " + latest;
+            String message = "DeepJS " + latest + " is available (this is " + VERSION + "): " + RELEASES_PAGE;
+            tab.log(message);
+            api.logging().logToOutput(message);
+            refreshStatus();
+        }
+    }
+
+    static String latestTag(String releaseJson) {
+        Matcher m = TAG_NAME.matcher(releaseJson == null ? "" : releaseJson);
+        return m.find() ? m.group(1) : "";
+    }
+
+    /** Is version `candidate` ("0.10.1") later than `current`? Unparseable input is never newer. */
+    static boolean isNewer(String candidate, String current) {
+        if (candidate == null || current == null || !candidate.matches("\\d+(\\.\\d+)*") || !current.matches("\\d+(\\.\\d+)*")) {
+            return false;
+        }
+        String[] a = candidate.split("\\."), b = current.split("\\.");
+        for (int i = 0; i < Math.max(a.length, b.length); i++) {
+            long x = i < a.length ? Long.parseLong(a[i]) : 0, y = i < b.length ? Long.parseLong(b[i]) : 0;
+            if (x != y) {
+                return x > y;
+            }
+        }
+        return false;
     }
 
     @Override
@@ -294,7 +440,8 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
         int waiting = worker == null ? 0 : worker.pending();
         tab.setStatus(state + "  ·  " + analysedCount.get() + " response(s) analysed"
                 + (waiting > 0 ? ", " + waiting + " queued" : "")
-                + (fetchCount.get() > 0 ? ", " + fetchCount.get() + " fetched by DeepJS" : ""), healthy);
+                + (fetchCount.get() > 0 ? ", " + fetchCount.get() + " fetched by DeepJS" : "")
+                + (notice.isEmpty() ? "" : "  ·  " + notice), healthy);
     }
 
     private void raiseIssue(String[] f) {
@@ -413,9 +560,8 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
             } else {
                 boolean isMap = kind.startsWith("source map");
                 analysed.add(url + "|" + body.length + "|" + Arrays.hashCode(body));
-                analysedCount.incrementAndGet();
-                worker.submit(isMap ? "map" : "script", url, body);
-                tab.putScript(url, kind, "fetched (" + (body.length / 1024) + " KB)");
+                boolean queued = worker.submit(isMap ? "map" : "script", url, body);
+                tab.putScript(url, kind, "fetched (" + (body.length / 1024) + " KB)" + (queued ? "" : " — engine not running"));
                 try {
                     api.siteMap().add(rr);                  // so it is visible in Target like any other response
                 } catch (RuntimeException ignored) {
@@ -431,7 +577,11 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
 
     @Override
     public void analyseProxyHistory() {
-        new Thread(() -> {
+        background("deepjs-history", () -> {
+            if (!healthy) {
+                tab.log("proxy history: the engine is not running — see the message above");
+                return;
+            }
             int queued = 0;
             for (ProxyHttpRequestResponse item : api.proxy().history()) {
                 try {
@@ -443,7 +593,7 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
                 }
             }
             tab.log("proxy history: " + queued + " response(s) queued for analysis");
-        }, "deepjs-history").start();
+        });
     }
 
     @Override
@@ -540,7 +690,7 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
             return List.of();
         }
         JMenuItem item = new JMenuItem("Analyse with DeepJS");
-        item.addActionListener(e -> new Thread(() -> {
+        item.addActionListener(e -> background("deepjs-menu", () -> {
             int queued = 0;
             for (HttpRequestResponse rr : selected) {
                 try {
@@ -558,8 +708,9 @@ public final class DeepJsExtension implements BurpExtension, HttpHandler, Contex
                     // skip the item
                 }
             }
-            tab.log("context menu: " + queued + " response(s) queued for analysis");
-        }, "deepjs-menu").start());
+            tab.log("context menu: " + queued + " response(s) queued for analysis"
+                    + (healthy ? "" : " — the engine is not running"));
+        }));
         return List.of(item);
     }
 }

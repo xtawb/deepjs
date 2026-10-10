@@ -508,6 +508,15 @@ class _Extractor:
             props = p.object_at(brace)
             if any(k in props for k in ("method", "type", "verb", "data", "body", "params", "headers")):
                 self._from_config(brace, "config", i, conf=0.85)
+            elif key == "url" and len(props) == 1 and p.is_punc(brace - 1, "(") and p.kind(brace - 2) == ID \
+                    and not (p.kind(brace - 3) == ID and p.val(brace - 3) == "new"):
+                # request({url: "/api/tags"}) — the whole config is the URL
+                parts, end = p.eval_expr(i + 2)
+                text = render(parts)
+                literal = "".join(t for v, t in parts if not v)
+                if parts and end >= p.pairs[brace] and not _STATIC_ASSET.search(text) and (
+                        _APIISH_ANY.search(text) or literal.startswith("/") and literal.count("/") >= 2):
+                    self._from_config(brace, "config", i, conf=0.7)
             return
         if key in ("to", "href", "routerLink", "pathname", "redirectTo", "returnTo"):
             # <Link to="/settings">, {href: "/pricing"}: navigation inside the app, not a request

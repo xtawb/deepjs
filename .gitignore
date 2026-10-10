@@ -7,3 +7,5 @@ dist/
 venv/
 out/
 burp/build/
+build/
+.gradle/

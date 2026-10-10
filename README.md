@@ -111,21 +111,27 @@ and the results appear in a **DeepJS** tab:
 - *Analyse proxy history* for traffic captured before the extension was loaded,
   and *Analyse with DeepJS* in the context menu.
 
-It works in Burp Suite Community and Professional. The analysis is done by the
-Python engine in a local worker process (`deepjs serve`), so the extension
-needs DeepJS installed:
+It works in Burp Suite Community and Professional.
 
-```bash
-pip install --upgrade git+https://github.com/xtawb/deepjs      # 0.2.0 or newer
-python burp/build.py                                           # → burp/build/deepjs-burp.jar  (needs a JDK 17+)
-```
+**Install:** download `deepjs-burp.jar` from the
+[latest release](https://github.com/xtawb/deepjs/releases/latest), then in Burp:
+**Extensions → Add → Extension type: Java →** select the file.
 
-Then in Burp: **Extensions → Add → Extension type: Java →** select
-`deepjs-burp.jar`. If the tab says the worker failed to start, set *Worker
-command* on the *Log / settings* tab to your Python, e.g.
-`"C:\Users\you\AppData\Local\Programs\Python\Python312\python.exe" -m deepjs serve`.
+The analysis engine is inside the jar — there is nothing to install with pip.
+It is Python, so the machine needs a Python 3.11+ interpreter; the extension
+tries `python`, `py -3` and `python3` (`python3`, `python` on Linux and macOS).
+If none of them works, the *Log / settings* tab says why, once, and takes the
+full path of an interpreter under *Python*. Responses that passed while the
+engine was not running are analysed from the proxy history as soon as it is.
 
-A prebuilt jar is attached to each CI run (Actions → latest run → `deepjs-burp`).
+The engine runs in a local process and never touches the network: every
+request the extension makes goes through Burp. When Burp starts, the extension
+asks GitHub — one request, through Burp — whether a newer release exists and
+says so in its status line; *Check for updates when Burp starts* turns that off.
+
+**Build it yourself** (JDK 17+): `gradle jar` → `build/libs/deepjs-burp.jar`,
+or `python burp/build.py --test`, which needs no Gradle and also runs the test
+harness against the jar it built.
 
 ## Crawling
 
@@ -138,6 +144,11 @@ leaves the target host unless you pass `--scope`, and `--no-crawl` restores
 single-page behaviour. Requests use a desktop-browser User-Agent by default
 because many CDNs refuse anything else (`--user-agent` to change it); when
 requests are refused anyway the report says so and how to get past it.
+
+After a scan, `deepjs` tells you when a newer release exists. That is one
+anonymous request to GitHub's API at most once a day (the answer is cached),
+it sends nothing about the scan, and nothing is downloaded or installed.
+`--no-update-check` or `DEEPJS_NO_UPDATE_CHECK=1` turns it off.
 
 Two things keep it from wasting requests. A single-page app answers every
 route with the same HTML shell, so DeepJS probes three routes and, if they come
@@ -287,8 +298,10 @@ second column filters such matches instead.
 - **The crawler does not run JavaScript.** Pages that only exist after client-side
   rendering are reached through routes and chunk maps, not by clicking. For an
   app behind a login, pass your session (`-H "Cookie: …"`) or use the Burp extension.
-- **The Burp extension** is compiled against the Montoya API and its engine
-  bridge and UI models are tested outside Burp; behaviour inside every Burp
+- **The Burp extension needs a Python 3.11+ interpreter** on the machine. The
+  engine is in the jar, but it is Python, not Java.
+- **The Burp extension** is compiled against the Montoya API and tested against
+  a mocked Burp API (the harness in `burp/test`); behaviour inside every Burp
   version is not something CI can test.
 
 ## How it works

@@ -7,14 +7,15 @@ import java.util.List;
 import javax.swing.SwingUtilities;
 
 /**
- * Exercises everything in the extension that does not need Burp itself:
- * the protocol codec, the real `deepjs serve` process, the tab and its models,
- * and the request skeletons sent to Repeater.
+ * Exercises the extension without Burp: the protocol codec, the real engine
+ * process started from the engine inside the built jar, the tab and its
+ * models, the request skeletons sent to Repeater, and the extension class
+ * itself against a mocked Burp API.
  *
- *   java -cp <classes>:<montoya-api.jar> deepjs.burp.Harness [worker command…]
+ *   java -Ddeepjs.jar=<deepjs-burp.jar> -cp <classes>:<test-classes>:<montoya-api.jar> deepjs.burp.Harness [python…]
  *
- * Run from the repository root so `python -m deepjs` resolves. Exits non-zero
- * on the first failed check.
+ * Run it from a directory that has no `deepjs` package, so that the engine can
+ * only come from the jar. Exits non-zero on the first failed check.
  */
 public final class Harness {
 
@@ -38,10 +39,31 @@ public final class Harness {
         check(Worker.splitCommand("\"C:\\Program Files\\Python\\python.exe\" -m deepjs serve --reveal").get(0)
                 .equals("C:\\Program Files\\Python\\python.exe"), "split honours quotes");
 
-        // ── the real engine process ──────────────────────────────────────────
-        List<String> command = args.length > 0 ? List.of(args)
-                : Worker.splitCommand(System.getProperty("os.name").toLowerCase().contains("win")
-                        ? "python -m deepjs serve" : "python3 -m deepjs serve");
+        // ── which interpreter to try ─────────────────────────────────────────
+        check(DeepJsExtension.engineCommands("").size() >= 2
+                        && DeepJsExtension.engineCommands("").stream().allMatch(c -> c.subList(c.size() - 3, c.size()).equals(List.of("-m", "deepjs", "serve"))),
+                "with nothing configured, several interpreter names are tried");
+        check(DeepJsExtension.engineCommands("\"C:\\Program Files\\Python\\python.exe\"")
+                        .equals(List.of(List.of("C:\\Program Files\\Python\\python.exe", "-m", "deepjs", "serve"))),
+                "a configured interpreter is the only one tried");
+        check(DeepJsExtension.engineCommands("py -3 -m deepjs serve").equals(List.of(List.of("py", "-3", "-m", "deepjs", "serve"))),
+                "a pasted command line keeps its interpreter");
+
+        // ── update notice ────────────────────────────────────────────────────
+        check(DeepJsExtension.latestTag("{\"url\":\"x\",\"tag_name\": \"v1.12.0\",\"name\":\"n\"}").equals("1.12.0"), "tag is read");
+        check(DeepJsExtension.latestTag("<html>rate limited</html>").isEmpty(), "no tag in an error page");
+        check(DeepJsExtension.isNewer("0.10.0", "0.9.9") && DeepJsExtension.isNewer("1.0", "0.99.99")
+                && !DeepJsExtension.isNewer("0.3.0", "0.3.0") && !DeepJsExtension.isNewer("0.2.9", "0.3.0")
+                && !DeepJsExtension.isNewer("", "0.3.0") && !DeepJsExtension.isNewer("nightly", "0.3.0"), "version comparison");
+
+        // ── the real engine process, from the engine inside the jar ──────────
+        String jar = System.getProperty("deepjs.jar", "");
+        check(!jar.isEmpty() && new java.io.File(jar).isFile(), "-Ddeepjs.jar points at the built jar: " + jar);
+        String enginePath = jar + java.io.File.separator + "engine";
+        List<String> python = args.length > 0 ? List.of(args)
+                : List.of(System.getProperty("os.name").toLowerCase().contains("win") ? "python" : "python3");
+        List<String> command = new ArrayList<>(python);
+        command.addAll(List.of("-m", "deepjs", "serve"));
         List<String[]> messages = Collections.synchronizedList(new ArrayList<>());
         List<String> states = Collections.synchronizedList(new ArrayList<>());
         Worker worker = new Worker(command, new Worker.Listener() {
@@ -49,9 +71,11 @@ public final class Harness {
             public void onState(String text, boolean healthy) { states.add((healthy ? "ok: " : "BAD: ") + text); }
             public void onLog(String text) { System.out.println("  [log] " + text); }
         });
+        worker.setEnginePath(enginePath);
         check(worker.start(), "worker starts (" + String.join(" ", command) + ") — states: " + states);
-        check(!worker.version().isEmpty(), "worker reports its version");
-        System.out.println("engine: deepjs " + worker.version());
+        check(worker.version().equals(DeepJsExtension.VERSION),
+                "the engine that answers is the one in the jar: " + worker.version() + " vs " + DeepJsExtension.VERSION);
+        System.out.println("engine: deepjs " + worker.version() + " (from " + enginePath + ")");
 
         String base = "https://app.acme.io";
         String runtime = "(()=>{var r={};r.p=\"/\";r.u=e=>\"static/js/\"+({3:\"admin\"}[e]||e)+\".\"+"
@@ -101,7 +125,41 @@ public final class Harness {
             public void onLog(String text) { }
         });
         check(!broken.start() && !bad.isEmpty(), "a missing engine is reported as a state, not an exception");
+        for (int i = 0; i < 5; i++) {
+            check(!broken.submit("script", base + "/x.js", new byte[]{'1'}), "nothing is queued for an engine that cannot start");
+        }
+        Thread.sleep(300);
+        check(bad.size() == 1, "…and the failure is reported once, not once per response: " + bad);
         broken.shutdown();
+
+        // the interpreter is there but has no engine: the reason is the interpreter's own message
+        List<String> noEngine = new ArrayList<>();
+        List<String> bare = new ArrayList<>(python);
+        bare.addAll(List.of("-m", "deepjs_is_not_installed_here", "serve"));
+        Worker missing = new Worker(bare, new Worker.Listener() {
+            public void onMessage(String[] f) { }
+            public void onState(String text, boolean healthy) { noEngine.add(text); }
+            public void onLog(String text) { }
+        });
+        long started = System.currentTimeMillis();
+        check(!missing.start() && noEngine.size() == 1 && noEngine.get(0).contains("No module named")
+                        && noEngine.get(0).contains("exited with code"),
+                "a Python without the engine is reported with its own error: " + noEngine);
+        check(System.currentTimeMillis() - started < 15_000, "…without waiting for the start timeout");
+        missing.shutdown();
+
+        // the first candidate fails, the second works
+        List<String> fallback = new ArrayList<>();
+        Worker second = new Worker(List.of(), new Worker.Listener() {
+            public void onMessage(String[] f) { }
+            public void onState(String text, boolean healthy) { fallback.add((healthy ? "ok: " : "BAD: ") + text); }
+            public void onLog(String text) { }
+        });
+        second.setEnginePath(enginePath);
+        second.setCommands(List.of(List.of("definitely-not-a-real-command-xyz", "-m", "deepjs", "serve"), command));
+        check(second.start() && fallback.size() == 1 && fallback.get(0).startsWith("ok: "),
+                "the next interpreter is tried when the first is missing: " + fallback);
+        second.shutdown();
 
         // ── the tab and its models (no Burp, no display) ─────────────────────
         List<List<String[]>> toRepeater = new ArrayList<>();
@@ -111,7 +169,7 @@ public final class Harness {
             public void fetchHiddenNow() { }
             public void analyseProxyHistory() { }
             public void clearAll() { }
-            public void restartWorker(String commandLine) { }
+            public void restartWorker(String python) { }
             public void settingsChanged() { }
         }));
         DeepJsTab tab = holder[0];
@@ -141,7 +199,9 @@ public final class Harness {
         check(DeepJsExtension.requestUrl(new String[]{"GET", "{base}/users", "", "", "", "fetch", ""}) == null,
                 "an endpoint with no known host is not sent");
 
-        extensionAgainstMockedBurp(String.join(" ", command.stream().map(c -> c.contains(" ") ? "\"" + c + "\"" : c).toList()));
+        String pythonSetting = String.join(" ", python.stream().map(c -> c.contains(" ") ? "\"" + c + "\"" : c).toList());
+        extensionAgainstMockedBurp(pythonSetting, jar);
+        extensionRecoversFromAMissingEngine(pythonSetting, jar);
 
         System.out.println("harness: " + checks + " checks passed");
         System.exit(0);
@@ -175,9 +235,10 @@ public final class Harness {
      * through it: the handler, the engine bridge, the fetching of hidden
      * chunks and source maps "through Burp", Repeater, history, context menu.
      */
-    private static void extensionAgainstMockedBurp(String workerCommand) throws Exception {
+    private static void extensionAgainstMockedBurp(String python, String jar) throws Exception {
         String base = "https://app.acme.io";
-        MockBurp fake = new MockBurp(workerCommand);
+        MockBurp fake = new MockBurp(python, jar);
+        fake.site.put(DeepJsExtension.RELEASES_API, "{\"tag_name\":\"v99.1.0\",\"name\":\"DeepJS 99.1.0\"}");
         fake.site.put(base + "/static/js/admin.9f1c2a.chunk.js",
                 "function del(e){return fetch(\"/api/v1/admin/users/\"+e,{method:\"DELETE\"})}");
         fake.site.put(base + "/static/js/main.js.map",
@@ -188,12 +249,19 @@ public final class Harness {
         check(burp.api.montoya.BurpExtension.class.isAssignableFrom(DeepJsExtension.class), "implements BurpExtension");
         ext.initialize(fake.api());
         check(fake.suiteTab == ext.tab && fake.unloadHandler != null, "registers its tab and an unload handler");
-        check(ext.tab.command.getText().equals(workerCommand), "reads the saved worker command");
+        check(ext.tab.command.getText().equals(python), "reads the saved Python setting");
         long end = System.currentTimeMillis() + 30_000;
         while (!ext.worker.alive() || ext.worker.version().isEmpty()) {
             check(System.currentTimeMillis() < end, "engine starts under the extension");
             Thread.sleep(100);
         }
+        check(ext.worker.version().equals(DeepJsExtension.VERSION), "the extension runs the engine it carries");
+        end = System.currentTimeMillis() + 10_000;
+        while (fake.output.stream().noneMatch(line -> line.contains("99.1.0 is available")) && System.currentTimeMillis() < end) {
+            Thread.sleep(100);
+        }
+        check(fake.output.stream().anyMatch(line -> line.contains("DeepJS 99.1.0 is available")),
+                "a newer release is announced: " + fake.output);
 
         // 1. the browser loads the runtime and the main bundle through the proxy
         String runtime = "(()=>{var r={};r.p=\"/\";r.u=e=>\"static/js/\"+({3:\"admin\"}[e]||e)+\".\"+"
@@ -294,5 +362,46 @@ public final class Harness {
         Thread.sleep(300);
         check(!ext.worker.alive(), "unloading the extension stops the engine");
         System.out.println("extension against mocked Burp: ok (" + fake.requested.size() + " request(s) made through Burp)");
+    }
+
+    /**
+     * What happened on a real machine: Burp's Python could not run the engine.
+     * The failure must be explained once, nothing may be lost, and fixing the
+     * setting must be enough — the traffic already in the proxy history is analysed.
+     */
+    private static void extensionRecoversFromAMissingEngine(String python, String jar) throws Exception {
+        String base = "https://shop.acme.io";
+        MockBurp fake = new MockBurp("definitely-not-a-real-command-xyz", jar);
+        DeepJsExtension ext = new DeepJsExtension();
+        ext.initialize(fake.api());
+        String[] log = new String[1];
+        long end = System.currentTimeMillis() + 30_000;
+        do {
+            Thread.sleep(150);
+            SwingUtilities.invokeAndWait(() -> log[0] = ext.tab.logText());
+        } while (!log[0].contains("engine not started") && System.currentTimeMillis() < end);
+        check(log[0].contains("engine not started") && log[0].contains("full path"), "a missing interpreter is explained:\n" + log[0]);
+
+        for (int i = 0; i < 6; i++) {
+            String body = "fetch(\"/api/v1/orders/" + i + "\")";
+            fake.history.add(fake.pair(base + "/static/js/o" + i + ".js", body, burp.api.montoya.http.message.MimeType.SCRIPT));
+            ext.handleHttpResponseReceived(fake.proxied(base + "/static/js/o" + i + ".js", body, burp.api.montoya.http.message.MimeType.SCRIPT));
+        }
+        Thread.sleep(500);
+        SwingUtilities.invokeAndWait(() -> log[0] = ext.tab.logText());
+        check(log[0].split("engine not started", -1).length - 1 == 1, "…once, however many responses pass:\n" + log[0]);
+        check(ext.tab.endpoints.getRowCount() == 0, "nothing is analysed while the engine is down");
+
+        ext.restartWorker(python);                               // the user enters a working interpreter
+        end = System.currentTimeMillis() + 40_000;
+        while (ext.tab.endpoints.getRowCount() < 6 && System.currentTimeMillis() < end) {
+            Thread.sleep(200);
+            SwingUtilities.invokeAndWait(() -> { });
+        }
+        String urls = column(ext.tab.endpoints, DeepJsTab.E_URL);
+        check(urls.contains(base + "/api/v1/orders/0") && urls.contains(base + "/api/v1/orders/5"),
+                "after the fix, what passed while the engine was down is analysed from the proxy history:\n" + urls);
+        fake.unloadHandler.extensionUnloaded();
+        System.out.println("recovery from a missing engine: ok");
     }
 }

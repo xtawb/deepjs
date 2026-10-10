@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 
 from deepjs import __version__
 from deepjs.engine import Engine, Options
-from deepjs import report
+from deepjs import report, update
 
 EPILOG = """\
 examples:
@@ -75,6 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = s.add_argument_group("output")
     g.add_argument("--limit", type=int, default=25, help="rows per section in the terminal summary (default 25)")
     g.add_argument("-q", "--quiet", action="store_true", help="no progress messages")
+    g.add_argument("--no-update-check", action="store_true",
+                   help="do not ask GitHub (at most once a day) whether a newer deepjs exists")
     g.add_argument("--no-color", action="store_true", help="disable coloured output")
 
     w = sub.add_parser("serve", help="analysis worker on stdin/stdout — used by the Burp Suite extension")
@@ -136,6 +138,10 @@ def cmd_scan(args) -> int:
         for path in report.write_all(result, args.output, args.reveal):
             if not quiet:
                 print(f"  wrote {path}", file=sys.stderr)
+    if not quiet and not args.no_update_check:
+        newer = update.notice()
+        if newer:
+            print(f"\n  {newer}", file=sys.stderr)
     return 0 if (result.files or not result.errors) else 1
 
 

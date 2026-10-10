@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 
-from deepjs import chunks, corpus, sourcemap
+from deepjs import chunks, corpus, sourcemap, update
 from deepjs.endpoints import extract
 from deepjs.entropy import classify, is_placeholder
 from deepjs.hosts import HostCollector, classify_host, registrable
@@ -226,6 +226,12 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(calls('const d=await Qe({headers:i,url:`api/profiles/${a}`})'), {("GET", "api/profiles/{param}")})
         self.assertEqual(calls('this.$axios.$get("/articles/feed",{params:{limit:r}});o.$post("/articles",{article:t})'),
                          {("GET", "/articles/feed"), ("POST", "/articles")})
+
+    def test_a_config_that_is_only_a_url(self):
+        self.assertEqual(calls('async function tags(){const{data:a}=await Qe({url:"/api/tags"});return a.tags}'),
+                         {("GET", "/api/tags")})
+        # not a request: a constructor's options, an asset, a lone word
+        self.assertEqual(calls('new Uploader({url:"/api/upload"});load({url:"/img/logo.png"});track({url:"home"})'), set())
 
     def test_api_client_wrappers_give_a_base_not_an_endpoint(self):
         ex = extract(Program('const env={api_url:"https://conduit.acme.io/api"};'
@@ -448,6 +454,71 @@ class ChunkTests(unittest.TestCase):
         found = chunks.scripts_from_html(html, "https://x.io/")
         self.assertEqual(found.urls, ["https://x.io/app/static/main.js", "https://cdn.x.io/v.js", "https://x.io/m.js"])
         self.assertEqual(found.inline, ['window.__CFG__={api:"/api/boot"}'])
+
+
+class UpdateTests(unittest.TestCase):
+    """The update notice: no network here — the fetch is injected and the cache is a temporary file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache = os.path.join(self.tmp.name, "nested", "update.json")
+        self.fetched = 0
+        self.saved_env = os.environ.pop("DEEPJS_NO_UPDATE_CHECK", None)
+
+    def tearDown(self):
+        if self.saved_env is not None:
+            os.environ["DEEPJS_NO_UPDATE_CHECK"] = self.saved_env
+        self.tmp.cleanup()
+
+    def release(self, version):
+        def fetch():
+            self.fetched += 1
+            if version is None:
+                raise OSError("offline")
+            return version
+        return fetch
+
+    def test_versions(self):
+        self.assertEqual(update.parse_version("v0.10.1"), (0, 10, 1))
+        self.assertEqual(update.parse_version("nightly-2026"), ())
+        self.assertTrue(update.is_newer("0.10.0", "0.9.9"))
+        self.assertTrue(update.is_newer("1.0", "0.99.99"))
+        self.assertFalse(update.is_newer("0.3", "0.3.0"))
+        self.assertFalse(update.is_newer("0.2.9", "0.3.0"))
+        self.assertFalse(update.is_newer("", "0.3.0"))
+
+    def test_asks_at_most_once_a_day(self):
+        day = 24 * 3600
+        self.assertEqual(update.latest_version(now=1000.0, fetch=self.release("9.1.0"), path=self.cache), "9.1.0")
+        self.assertEqual(update.latest_version(now=1000.0 + day - 1, fetch=self.release("9.2.0"), path=self.cache), "9.1.0")
+        self.assertEqual(self.fetched, 1)
+        self.assertEqual(update.latest_version(now=1000.0 + day + 1, fetch=self.release("9.2.0"), path=self.cache), "9.2.0")
+        self.assertEqual(self.fetched, 2)
+
+    def test_offline_is_silent_and_not_retried_at_once(self):
+        self.assertEqual(update.notice("0.3.0", now=5000.0, fetch=self.release(None), path=self.cache), "")
+        self.assertEqual(update.notice("0.3.0", now=5060.0, fetch=self.release(None), path=self.cache), "")
+        self.assertEqual(self.fetched, 1)
+
+    def test_notice(self):
+        text = update.notice("0.3.0", now=1.0, fetch=self.release("0.4.0"), path=self.cache)
+        self.assertIn("deepjs 0.4.0 is available (this is 0.3.0)", text)
+        self.assertIn("pip install --upgrade", text)
+        self.assertEqual(update.notice("0.4.0", now=2.0, fetch=self.release("0.4.0"), path=self.cache), "")
+        os.environ["DEEPJS_NO_UPDATE_CHECK"] = "1"
+        try:
+            other = os.path.join(self.tmp.name, "other.json")
+            self.assertEqual(update.notice("0.1.0", now=3.0, fetch=self.release("9.9.9"), path=other), "")
+            self.assertFalse(os.path.exists(other))               # switched off: not even a cache file
+        finally:
+            del os.environ["DEEPJS_NO_UPDATE_CHECK"]
+
+    def test_a_cache_that_cannot_be_written_is_not_an_error(self):
+        blocked = os.path.join(self.tmp.name, "file")
+        with open(blocked, "w") as fh:
+            fh.write("x")
+        path = os.path.join(blocked, "update.json")                # its parent is a file
+        self.assertEqual(update.latest_version(now=1.0, fetch=self.release("1.2.3"), path=path), "1.2.3")
 
 
 if __name__ == "__main__":

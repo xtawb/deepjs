@@ -134,7 +134,8 @@ final class DeepJsTab extends JPanel {
     final JCheckBox fetchMaps = new JCheckBox("Fetch source maps", true);
     final JCheckBox raiseIssues = new JCheckBox("Report secrets as issues", true);
     final JCheckBox showStrings = new JCheckBox("Show string-only paths", true);
-    final JTextField command = new JTextField(38);
+    final JCheckBox updateCheck = new JCheckBox("Check for updates when Burp starts", true);
+    final JTextField command = new JTextField(34);
 
     private final JLabel status = new JLabel("starting…");
     private final JTextArea other = new JTextArea();
@@ -272,10 +273,15 @@ final class DeepJsTab extends JPanel {
 
     private JPanel settingsPanel() {
         JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
-        top.add(new JLabel("Worker command:"));
+        top.add(new JLabel("Python:"));
         top.add(command);
         top.add(button("Apply / restart", e -> actions.restartWorker(command.getText())));
-        command.setToolTipText("How to start the DeepJS engine, e.g.  python -m deepjs serve   (pip install deepjs first)");
+        top.add(Box.createHorizontalStrut(10));
+        top.add(updateCheck);
+        command.setToolTipText("The Python 3 interpreter that runs the analysis engine. Leave empty to find it automatically, "
+                + "or give its full path.");
+        updateCheck.setToolTipText("One request to api.github.com, sent through Burp, to see whether a newer DeepJS has been released");
+        updateCheck.addActionListener(e -> actions.settingsChanged());
         JPanel p = textPanel(log);
         p.add(top, BorderLayout.NORTH);
         return p;
@@ -389,6 +395,11 @@ final class DeepJsTab extends JPanel {
         });
     }
 
+    /** Everything logged so far (call on the event dispatch thread). */
+    String logText() {
+        return log.getText();
+    }
+
     void setStatus(String text, boolean healthy) {
         onEdt(() -> {
             status.setText(text);
@@ -408,7 +419,7 @@ final class DeepJsTab extends JPanel {
     }
 
     void forEachOption(Consumer<JCheckBox> c) {
-        for (JCheckBox box : new JCheckBox[]{enabled, scopeOnly, fetchHidden, fetchMaps, raiseIssues}) {
+        for (JCheckBox box : new JCheckBox[]{enabled, scopeOnly, fetchHidden, fetchMaps, raiseIssues, updateCheck}) {
             c.accept(box);
         }
     }

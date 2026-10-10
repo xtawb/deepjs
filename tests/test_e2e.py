@@ -22,6 +22,8 @@ from deepjs import cli, report
 from deepjs.engine import Engine, Options
 from deepjs.fetch import Fetcher
 
+os.environ["DEEPJS_NO_UPDATE_CHECK"] = "1"       # these tests use no external network
+
 AWS_KEY = "AKIA" + "Q7ZP2MXL4RT9VB6N"
 STRIPE_PK = "pk_" + "live_9aK2mQ7xL4pR8tY1wZ6nC3vB"
 CLIENT_SECRET = "Zx9Qm2Lk8Pz4Rt6V" + "w1Yb5Nc7Hf0Jg3Ua"

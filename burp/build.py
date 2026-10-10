@@ -4,11 +4,15 @@ Build the DeepJS Burp Suite extension → burp/build/deepjs-burp.jar
 
     python burp/build.py                       # compile against the Montoya API from Maven Central
     python burp/build.py --api burpsuite.jar   # …or against a local Burp / montoya-api jar (no download)
-    python burp/build.py --test                # also run the harness (needs `python -m deepjs` to work)
+    python burp/build.py --test                # also run the harness against the built jar
 
-Needs a JDK 17+ (`javac`, `jar`) on PATH or in JAVA_HOME. No Gradle, no Maven:
-the extension has no dependencies besides the Burp API, which Burp provides at
-run time and is therefore not packaged into the jar.
+Needs a JDK 17+ (`javac`, `jar`) on PATH or in JAVA_HOME. The repository's
+build.gradle produces the same jar; this script exists so that the extension
+can be built and tested with nothing but a JDK and Python.
+
+The jar holds the extension's classes and, under engine/, the analysis engine
+(this repository's `deepjs` package). The Burp API is provided by Burp at run
+time and is not packaged.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -74,25 +79,44 @@ def main() -> int:
     # compile those sources into our output directory.
     run([tool("javac"), "--release", "17", "-encoding", "UTF-8", "-implicit:none", "-cp", api, "-d", classes, *sources])
 
+    # The engine travels with the extension: one version, nothing to install with pip.
+    engine = os.path.join(classes, "engine", "deepjs")
+    os.makedirs(engine)
+    package = os.path.join(ROOT, "deepjs")
+    for name in sorted(os.listdir(package)):
+        if name.endswith(".py"):
+            shutil.copyfile(os.path.join(package, name), os.path.join(engine, name))
+    with open(os.path.join(package, "__init__.py"), encoding="utf-8") as fh:
+        engine_version = re.search(r'__version__\s*=\s*"([^"]+)"', fh.read()).group(1)
+    with open(os.path.join(HERE, "src", "deepjs", "burp", "DeepJsExtension.java"), encoding="utf-8") as fh:
+        extension_version = re.search(r'String VERSION\s*=\s*"([^"]+)"', fh.read()).group(1)
+    if engine_version != extension_version:
+        sys.exit(f"build: the extension says {extension_version} but the engine is {engine_version} — keep them equal")
+
     jar = os.path.join(out, "deepjs-burp.jar")
     if os.path.exists(jar):
         os.remove(jar)
     # Package only our own classes. A copy of the Burp API inside the jar would be
     # loaded by the extension's class loader and no longer match Burp's own types.
-    run([tool("jar"), "--create", "--file", jar, "-C", classes, "deepjs"])
+    run([tool("jar"), "--create", "--file", jar, "-C", classes, "deepjs", "-C", classes, "engine"])
     with zipfile.ZipFile(jar) as zf:
-        foreign = [n for n in zf.namelist() if n.endswith(".class") and not n.startswith("deepjs/burp/")]
+        names = zf.namelist()
+    foreign = [n for n in names if n.endswith(".class") and not n.startswith("deepjs/burp/")]
     if foreign:
         sys.exit(f"build: the jar contains classes that are not ours: {foreign[:3]} …")
-    print(f"  built {jar} ({os.path.getsize(jar) // 1024} KB)")
+    if "engine/deepjs/__main__.py" not in names:
+        sys.exit("build: the engine is missing from the jar")
+    print(f"  built {jar} ({os.path.getsize(jar) // 1024} KB, extension and engine {engine_version})")
 
     if args.test:
         tests = sorted(glob.glob(os.path.join(HERE, "test", "deepjs", "burp", "*.java")))
         cp = os.pathsep.join([classes, api])
         run([tool("javac"), "--release", "17", "-encoding", "UTF-8", "-implicit:none", "-cp", cp, "-d", test_classes, *tests])
         cp = os.pathsep.join([classes, test_classes, api])
-        worker = [sys.executable, "-m", "deepjs", "serve"]      # the interpreter that is running this script
-        run([tool("java"), "-Djava.awt.headless=true", "-cp", cp, "deepjs.burp.Harness", *worker], cwd=ROOT)
+        # Run from the output directory, where there is no `deepjs` package to import:
+        # the engine can then only come from the jar, as it does inside Burp.
+        run([tool("java"), "-Djava.awt.headless=true", f"-Ddeepjs.jar={jar}", "-cp", cp, "deepjs.burp.Harness",
+             sys.executable], cwd=out)
     return 0
 
 
